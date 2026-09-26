@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=System Info
+GenericName=Describe this machine
+Comment=Show every part of this system: hardware, OS, boot and Omarchy state
+Icon=utilities-system-monitor
+Exec=omarchy-sysinfo
+Terminal=true
+Categories=System;Monitor;ConsoleOnly;
+Keywords=system;hardware;info;cpu;memory;disk;omarchy
+StartupNotify=false

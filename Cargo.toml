@@ -1,0 +1,21 @@
+[package]
+name = "omarchy-sysinfo"
+version = "0.1.0"
+edition = "2021"
+description = "A TUI that describes this machine: hardware, OS, boot and Omarchy state"
+license = "MIT"
+
+# No dependencies. Everything here is std-only: the renderer, the keyboard
+# decoder, the /proc and /sys parsers, and the theme reader.
+[dependencies]
+
+[[bin]]
+name = "omarchy-sysinfo"
+path = "src/main.rs"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
