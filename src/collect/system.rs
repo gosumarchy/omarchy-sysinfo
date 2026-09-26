@@ -4,7 +4,6 @@ use super::{
     units::{dash, human_secs},
     Row,
 };
-use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn rows(stats: &mut Stats) -> Vec<Row> {
@@ -82,11 +81,8 @@ pub fn rows(stats: &mut Stats) -> Vec<Row> {
         dash(detect_virtualization(&sys_vendor, &product_name).map(str::to_string)),
     ));
     rows.push(Row::field("Container", container()));
-    rows.push(Row::field("Secure Boot", secure_boot()));
-    rows.push(Row::field(
-        "Kernel lockdown",
-        dash(read("/sys/kernel/security/lockdown")),
-    ));
+    // Secure Boot and Kernel lockdown belong to the firmware group in
+    // `dmi::rows`; repeating them here printed both twice in the report.
     rows.push(Row::field("Timezone", timezone()));
     rows.push(Row::field("Locale", dash(std::env::var("LANG").ok())));
 
@@ -188,20 +184,6 @@ pub fn kernel() -> String {
 
 pub fn arch() -> String {
     std::env::consts::ARCH.to_string()
-}
-
-fn secure_boot() -> String {
-    let enrolled = read(Path::new(
-        "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
-    ))
-    .map(|v| v.trim_start_matches('\u{0}').to_string());
-    let efi = Path::new("/sys/firmware/efi").exists();
-    match enrolled {
-        Some(v) if v.starts_with("01") => "enabled".to_string(),
-        Some(_) => "disabled".to_string(),
-        None if !efi => "not available (legacy bios)".to_string(),
-        None => "not enrolled".to_string(),
-    }
 }
 
 pub fn timezone() -> String {
@@ -441,7 +423,6 @@ EMPTY=
         assert!(!hostname().is_empty());
         assert!(!container().is_empty());
         assert!(!timezone().is_empty());
-        assert!(!secure_boot().is_empty());
     }
 
     #[test]

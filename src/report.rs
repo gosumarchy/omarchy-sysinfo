@@ -203,4 +203,21 @@ mod tests {
         ];
         let _ = format_section(&section(rows));
     }
+
+    #[test]
+    fn the_live_report_carries_no_control_characters() {
+        // One NUL anywhere makes grep call the whole report a binary file, which
+        // is what a UTF-16 EFI variable read as raw bytes used to do: the loader
+        // description came out as "L\0i\0m\0i\0n\0e\0" and `--plain | grep`
+        // answered "binary file matches" instead of printing a section.
+        let mut app = App::new();
+        app.collect();
+
+        for line in format_report(&app.sections) {
+            assert!(
+                !line.chars().any(|c| c.is_control() && c != '\n'),
+                "control character in {line:?}"
+            );
+        }
+    }
 }

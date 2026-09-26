@@ -74,36 +74,13 @@ pub fn rows() -> Vec<Row> {
     }
 
     rows.push(Row::Header("Firmware features".into()));
-    for (label, path) in [
-        (
-            "Secure Boot",
-            "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c",
-        ),
-        (
-            "Boot loader",
-            "/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f",
-        ),
-    ] {
-        let Some(v) = read(Path::new(path)) else {
-            continue;
-        };
-        let clean = v.trim_start_matches('\u{0}').trim().to_string();
-        if clean.is_empty() {
-            continue;
-        }
-        // The loader description was read and then thrown away by a
-        // `label == "Secure Boot"` guard, so this row never appeared.
-        let value = if label == "Secure Boot" {
-            if clean.starts_with("01") {
-                "enabled"
-            } else {
-                "disabled"
-            }
-            .to_string()
-        } else {
-            clean
-        };
-        rows.push(Row::field(label, value));
+    if let Some(state) = secure_boot_state() {
+        rows.push(Row::field("Secure Boot", state));
+    }
+    // The loader description was read and then thrown away by a
+    // `label == "Secure Boot"` guard, so this row never appeared.
+    if let Some(loader) = efi_text(SECURE_BOOT_LOADER) {
+        rows.push(Row::field("Boot loader", loader));
     }
     rows.push(Row::field("EFI", efi_state()));
     rows.push(Row::field(
@@ -121,6 +98,59 @@ fn efi_state() -> String {
     }
     let vars = super::fs::list_dir(efi.join("efivars")).len();
     format!("UEFI with {vars} firmware variables")
+}
+
+const SECURE_BOOT_VAR: &str =
+    "/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c";
+const SECURE_BOOT_LOADER: &str =
+    "/sys/firmware/efi/efivars/LoaderInfo-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f";
+
+/// How many bytes of an efivar file are header rather than data.
+///
+/// A variable read through `/sys/firmware/efi/efivars` starts with four
+/// attribute bytes, and the data follows. Getting this wrong is why Secure Boot
+/// used to report `disabled` on a machine with it enabled: the check looked at
+/// the first attribute byte instead of the byte after the header.
+const EFI_HEADER: usize = 4;
+
+/// Whether the firmware has Secure Boot turned on.
+fn secure_boot_state() -> Option<String> {
+    secure_boot_from(&read(Path::new(SECURE_BOOT_VAR))?)
+}
+
+fn secure_boot_from(raw: &str) -> Option<String> {
+    match raw.as_bytes().get(EFI_HEADER)? {
+        0x01 => Some("enabled".into()),
+        _ => Some("disabled".into()),
+    }
+}
+
+/// A text efivar, decoded.
+///
+/// The payload is UTF-16LE. Reading it as bytes put a NUL between every
+/// character, which is what made `omarchy-sysinfo --plain | grep` report
+/// "binary file matches" and paste a loader description into a bug report as a
+/// wall of NULs.
+fn efi_text(path: &str) -> Option<String> {
+    efi_text_from(&read(Path::new(path))?)
+}
+
+fn efi_text_from(raw: &str) -> Option<String> {
+    let payload = raw.as_bytes().get(EFI_HEADER..)?;
+
+    // An odd trailing byte cannot be a UTF-16 unit; `chunks_exact` drops it
+    // rather than let from_utf16_lossy put a replacement character in the
+    // report.
+    let units: Vec<u16> = payload
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|pair| u16::from_le_bytes(*pair))
+        .collect();
+    let text = String::from_utf16_lossy(&units);
+    let text = text.trim_end_matches('\u{0}').trim();
+
+    (!text.is_empty()).then(|| text.to_string())
 }
 
 /// Human name of the chassis type, e.g. `10` means Notebook.
@@ -199,5 +229,62 @@ mod tests {
     #[test]
     fn efi_state_always_says_something() {
         assert!(!efi_state().is_empty());
+    }
+
+    // ---- efivars ---------------------------------------------------------
+
+    /// The bytes a real efivar file holds: four attribute bytes, then the data.
+    fn efivar(data: &[u8]) -> String {
+        let mut bytes = vec![0x06, 0x00, 0x00, 0x00];
+        bytes.extend_from_slice(data);
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// UTF-16LE, which is how the firmware stores a text variable.
+    fn utf16(text: &str) -> Vec<u8> {
+        text.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()
+    }
+
+    #[test]
+    fn a_text_efivar_is_decoded_rather_than_shown_as_nuls() {
+        // This is the exact shape of systemd-boot's LoaderInfo on this machine.
+        // Read as bytes it was "L\0i\0m\0i\0n\0e\0", and every NUL made grep
+        // treat the whole report as a binary file.
+        let raw = efivar(&utf16("Limine 12.8.0\0"));
+        assert_eq!(efi_text_from(&raw), Some("Limine 12.8.0".into()));
+    }
+
+    #[test]
+    fn a_text_efivar_with_no_header_or_no_text_is_absent() {
+        assert_eq!(efi_text_from(""), None, "too short to hold a header");
+        assert_eq!(efi_text_from(&efivar(&[])), None, "header but no data");
+        assert_eq!(
+            efi_text_from(&efivar(&utf16("\0\0"))),
+            None,
+            "all NUL is no value"
+        );
+    }
+
+    #[test]
+    fn an_odd_trailing_byte_does_not_become_a_replacement_character() {
+        let mut data = utf16("ab");
+        data.push(0x41);
+        let text = efi_text_from(&efivar(&data)).unwrap();
+        assert_eq!(text, "ab", "half a UTF-16 unit is dropped, not mangled");
+    }
+
+    #[test]
+    fn secure_boot_reads_the_byte_after_the_header() {
+        // The bug: the check looked at the first attribute byte, so an enabled
+        // machine still reported "disabled".
+        assert_eq!(secure_boot_from(&efivar(&[0x01])), Some("enabled".into()));
+        assert_eq!(secure_boot_from(&efivar(&[0x00])), Some("disabled".into()));
+        assert_eq!(secure_boot_from(&efivar(&[0x02])), Some("disabled".into()));
+    }
+
+    #[test]
+    fn secure_boot_is_absent_without_the_variable() {
+        assert_eq!(secure_boot_from(""), None);
+        assert_eq!(secure_boot_from(&efivar(&[])), None, "no data byte");
     }
 }
