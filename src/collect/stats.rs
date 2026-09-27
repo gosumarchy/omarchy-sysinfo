@@ -92,6 +92,7 @@ impl Memory {
                 ),
                 fraction(self.swap_used(), self.swap_total),
             ));
+            rows.push(Row::field("Swap devices", self.swap_devices.to_string()));
         }
 
         // zram is compressed, so its backing size is not its useful size.
@@ -100,9 +101,7 @@ impl Memory {
             rows.extend(zram);
         }
 
-        if self.swap_total > 0 {
-            rows.push(Row::Header("Memory map".into()));
-            rows.push(Row::field("Swap devices", self.swap_devices.to_string()));
+        if self.huge_pages_total > 0 {
             rows.push(Row::field(
                 "Huge pages",
                 format!("{} / {} free", self.huge_pages_free, self.huge_pages_total),
@@ -278,13 +277,13 @@ impl Stats {
         format!("{running} runnable / {total} threads")
     }
 
-    /// The kernel's own idle ratio since boot, from the aggregate `cpu` line.
+    /// The kernel's own idle ratio since boot, from the aggregate `cpu` line
+    /// `sample` already parsed.
     pub fn idle_since_boot(&self) -> Option<f64> {
-        let now = read_cpu_times().0;
-        if now.total == 0 {
+        if self.prev_total.total == 0 {
             return None;
         }
-        Some(now.idle as f64 / now.total as f64 * 100.0)
+        Some(self.prev_total.idle as f64 / self.prev_total.total as f64 * 100.0)
     }
 }
 
@@ -316,13 +315,24 @@ fn parse_cpu_times(stat: &str) -> (Times, Vec<Times>, Vec<String>) {
         if label != "cpu" && !is_core {
             continue;
         }
-        let values: Vec<u64> = fields.filter_map(|v| v.parse().ok()).collect();
-        if values.len() < 4 {
+        // user nice system idle iowait irq softirq steal ...
+        // A missing iowait (exactly four columns) is zero, not a panic.
+        let mut sum = 0u64;
+        let mut idle = 0u64;
+        let mut n = 0usize;
+        for value in fields {
+            let Ok(value) = value.parse::<u64>() else {
+                continue;
+            };
+            sum += value;
+            if n == 3 || n == 4 {
+                idle += value;
+            }
+            n += 1;
+        }
+        if n < 4 {
             continue;
         }
-        // user nice system idle iowait irq softirq steal ...
-        let sum: u64 = values.iter().sum();
-        let idle = values[3] + values[4];
         let times = Times { total: sum, idle };
 
         if label == "cpu" {
@@ -346,30 +356,31 @@ fn read_memory() -> Memory {
     mem
 }
 
-/// `/proc/meminfo` reports every size in kibibytes.
+/// `/proc/meminfo` reports every size in kibibytes. Huge-page lines are counts.
 fn parse_memory(info: &str) -> Memory {
-    let value = |key: &str| -> u64 {
-        info.lines()
-            .find(|l| l.starts_with(key))
-            .and_then(|l| l.split_whitespace().nth(1))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(0)
-            * 1024
-    };
-    Memory {
-        total: value("MemTotal:"),
-        available: value("MemAvailable:"),
-        free: value("MemFree:"),
-        cached: value("Cached:"),
-        buffers: value("Buffers:"),
-        swap_total: value("SwapTotal:"),
-        swap_free: value("SwapFree:"),
-        // These two are counts, not kibibytes, so undo the multiplication the
-        // shared helper applies.
-        huge_pages_total: value("HugePages_Total:") / 1024,
-        huge_pages_free: value("HugePages_Free:") / 1024,
-        ..Default::default()
+    let mut mem = Memory::default();
+    for line in info.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(key) = parts.next() else {
+            continue;
+        };
+        let Some(raw) = parts.next().and_then(|v| v.parse::<u64>().ok()) else {
+            continue;
+        };
+        match key {
+            "MemTotal:" => mem.total = raw * 1024,
+            "MemAvailable:" => mem.available = raw * 1024,
+            "MemFree:" => mem.free = raw * 1024,
+            "Cached:" => mem.cached = raw * 1024,
+            "Buffers:" => mem.buffers = raw * 1024,
+            "SwapTotal:" => mem.swap_total = raw * 1024,
+            "SwapFree:" => mem.swap_free = raw * 1024,
+            "HugePages_Total:" => mem.huge_pages_total = raw,
+            "HugePages_Free:" => mem.huge_pages_free = raw,
+            _ => {}
+        }
     }
+    mem
 }
 
 /// `/proc/swaps` has a header line, then one row per swap area.
@@ -579,6 +590,21 @@ Hugepagesize:       2048 kB
         let (total, cores, _) = parse_cpu_times("cpu 1 2 3\ncpu0 1 2 3\n");
         assert_eq!(total, Times::default());
         assert_eq!(cores.len(), 0);
+    }
+
+    #[test]
+    fn parse_cpu_times_treats_a_missing_iowait_as_zero() {
+        // Four columns is a legal older `/proc/stat`. Indexing iowait used to panic.
+        let (total, cores, _) = parse_cpu_times("cpu 10 0 0 90\ncpu0 10 0 0 90\n");
+        assert_eq!(
+            total,
+            Times {
+                total: 100,
+                idle: 90
+            }
+        );
+        assert_eq!(cores.len(), 1);
+        assert_eq!(cores[0].idle, 90);
     }
 
     #[test]

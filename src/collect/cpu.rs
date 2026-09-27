@@ -4,11 +4,19 @@ use super::{
     units::{human_mhz, human_secs},
     Row,
 };
+use std::sync::OnceLock;
+
+/// `/proc/cpuinfo` does not change for the life of the process.
+fn cpuinfo() -> String {
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED
+        .get_or_init(|| read("/proc/cpuinfo").unwrap_or_default())
+        .clone()
+}
 
 /// The name of the socket, e.g. `Ulysses-S`.
 pub fn brand() -> String {
-    let info = read("/proc/cpuinfo").unwrap_or_default();
-    parse_brand(&info)
+    parse_brand(&cpuinfo())
 }
 
 /// `model name` on x86, but ARM boards say `Hardware`, `Processor` or `Model`.
@@ -28,7 +36,7 @@ pub fn rows(stats: &mut Stats) -> Vec<Row> {
         Row::field("Model", brand()),
         Row::field(
             "Vendor",
-            super::units::dash(read("/proc/cpuinfo").and_then(|i| line_value(&i, "vendor_id"))),
+            super::units::dash(line_value(&cpuinfo(), "vendor_id")),
         ),
         Row::field(
             "Microcode",
@@ -72,9 +80,14 @@ pub fn rows(stats: &mut Stats) -> Vec<Row> {
         };
         rows.push(Row::field("Frequency range", range));
     }
-    if let Some(online) = read("/sys/devices/system/cpu/online").and_then(|o| o.parse::<u64>().ok())
-    {
-        rows.push(Row::field("Online CPUs", format!("{online}")));
+    if let Some(online) = read("/sys/devices/system/cpu/online") {
+        // The file is a CPU list (`0-15`, `0-3,8-11`), not a count. Parsing it
+        // as a number meant the row never appeared.
+        let value = match count_cpu_list(&online) {
+            Some(n) => format!("{n} · {online}"),
+            None => online,
+        };
+        rows.push(Row::field("Online CPUs", value));
     }
     rows.push(Row::field("Flags", flag_summary()));
 
@@ -184,8 +197,30 @@ fn line_value(cpuinfo: &str, key: &str) -> Option<String> {
 
 /// Group the ~50 CPU flags into the few that actually explain what this chip can do.
 fn flag_summary() -> String {
-    let info = read("/proc/cpuinfo").unwrap_or_default();
-    parse_flags(&info)
+    parse_flags(&cpuinfo())
+}
+
+/// How many CPUs a sysfs list names. `0-15` is 16, `0-3,8-11` is 8.
+fn count_cpu_list(list: &str) -> Option<u64> {
+    let mut count = 0u64;
+    for part in list.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        if let Some((start, end)) = part.split_once('-') {
+            let start = start.parse::<u64>().ok()?;
+            let end = end.parse::<u64>().ok()?;
+            if end < start {
+                return None;
+            }
+            count = count.saturating_add(end - start + 1);
+        } else {
+            part.parse::<u64>().ok()?;
+            count = count.saturating_add(1);
+        }
+    }
+    (count > 0).then_some(count)
 }
 
 fn parse_flags(cpuinfo: &str) -> String {
@@ -224,12 +259,7 @@ fn parse_flags(cpuinfo: &str) -> String {
     format!("{joined}  (+{} more)", flags.len())
 }
 
-/// Idle ratio straight from `/proc/stat`, a cheap cross-check on `sysinfo`.
-pub fn idle_hint() -> Option<String> {
-    let stat = read("/proc/stat")?;
-    parse_idle_hint(&stat)
-}
-
+#[cfg(test)]
 fn parse_idle_hint(stat: &str) -> Option<String> {
     let first = stat.lines().next()?;
     let mut parts = first.split_whitespace();
@@ -433,6 +463,21 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep aes avx2 avx512f fma sha_
         let text: String = rows.iter().map(|r| format!("{r:?}")).collect();
         assert!(!text.contains("NaN"), "a NaN leaked into the CPU rows");
         assert!(!text.contains('∞'), "an infinity leaked into the CPU rows");
+    }
+
+    #[test]
+    fn a_cpu_list_counts_ranges_and_holes() {
+        assert_eq!(count_cpu_list("0-15"), Some(16));
+        assert_eq!(count_cpu_list("0-3,8-11"), Some(8));
+        assert_eq!(count_cpu_list("0"), Some(1));
+        assert_eq!(count_cpu_list("0,2,4"), Some(3));
+        assert_eq!(
+            count_cpu_list("4-0"),
+            None,
+            "an inverted range is not a list"
+        );
+        assert_eq!(count_cpu_list("online"), None);
+        assert_eq!(count_cpu_list(""), None);
     }
 
     #[test]

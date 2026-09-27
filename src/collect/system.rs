@@ -4,6 +4,7 @@ use super::{
     units::{dash, human_secs},
     Row,
 };
+use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub fn rows(stats: &mut Stats) -> Vec<Row> {
@@ -31,7 +32,7 @@ pub fn rows(stats: &mut Stats) -> Vec<Row> {
     }
 
     rows.push(Row::Header("Boot".into()));
-    rows.push(Row::field("Command line", dash(read("/proc/cmdline"))));
+    rows.push(Row::field("Command line", dash(super::fs::cmdline())));
     for key in [
         "quiet",
         "splash",
@@ -55,22 +56,19 @@ pub fn rows(stats: &mut Stats) -> Vec<Row> {
     ));
     rows.push(Row::field(
         "Command",
-        dash(std::env::var("OMARCHY_SESSION").ok().or_else(|| {
-            std::process::Command::new("ps")
-                .args(["-p", &std::process::id().to_string(), "-o", "comm="])
-                .output()
+        dash(
+            std::env::var("OMARCHY_SESSION")
                 .ok()
-                .and_then(|o| String::from_utf8(o.stdout).ok())
-                .map(|s| s.trim().to_string())
-        })),
+                .or_else(|| read("/proc/self/comm")),
+        ),
     ));
 
     rows.push(Row::Header("Load".into()));
     if let Some(load) = read("/proc/loadavg") {
         rows.extend(parse_loadavg(&load));
     }
-    if let Some(idle) = super::cpu::idle_hint() {
-        rows.push(Row::field("CPU idle", idle));
+    if let Some(idle) = stats.idle_since_boot() {
+        rows.push(Row::field("CPU idle", format!("{idle:.0}% idle")));
     }
 
     rows.push(Row::Header("Platform".into()));
@@ -202,15 +200,20 @@ pub fn timezone() -> String {
 }
 
 /// Seconds since the epoch the kernel recorded for this boot.
+///
+/// `btime` does not move, so the `/proc/stat` read happens once.
 pub fn boot_epoch() -> u64 {
-    read("/proc/stat")
-        .and_then(|s| {
-            s.lines()
-                .find(|l| l.starts_with("btime"))
-                .and_then(|l| l.split_whitespace().nth(1))
-                .and_then(|v| v.parse().ok())
-        })
-        .unwrap_or(0)
+    static CACHED: OnceLock<u64> = OnceLock::new();
+    *CACHED.get_or_init(|| {
+        read("/proc/stat")
+            .and_then(|s| {
+                s.lines()
+                    .find(|l| l.starts_with("btime"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse().ok())
+            })
+            .unwrap_or(0)
+    })
 }
 
 /// One value out of an os-release style file.

@@ -6,6 +6,7 @@
 //! [`try_read`] is how a caller tells the two apart.
 
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 /// Read a file and return its trimmed contents, or `None` if it holds nothing.
 ///
@@ -52,6 +53,12 @@ pub fn read_f64(path: impl AsRef<Path>) -> Option<f64> {
     read(path).and_then(|s| s.parse().ok())
 }
 
+/// Raw bytes, for files that are not text. An empty file is absence.
+pub fn read_bytes(path: impl AsRef<Path>) -> Option<Vec<u8>> {
+    let bytes = std::fs::read(path).ok()?;
+    (!bytes.is_empty()).then_some(bytes)
+}
+
 /// Read a whole number, e.g. a capacity in bytes.
 ///
 /// Parsed straight to `u64` rather than through [`read_f64`]: a value that is not
@@ -94,13 +101,19 @@ pub fn driver_name(link: impl AsRef<Path>) -> Option<String> {
     Some(basename(&target.to_string_lossy()))
 }
 
+/// The kernel command line. It does not change until reboot.
+pub fn cmdline() -> Option<String> {
+    static CACHED: OnceLock<Option<String>> = OnceLock::new();
+    CACHED.get_or_init(|| read("/proc/cmdline")).clone()
+}
+
 /// The value the kernel was booted with for one `key=` on the command line.
 pub fn kernel_param(key: &str) -> Option<String> {
-    let cmdline = read("/proc/cmdline")?;
-
+    let cmdline = cmdline()?;
+    let prefix = format!("{key}=");
     cmdline
         .split_whitespace()
-        .find_map(|p| p.strip_prefix(&format!("{key}=")).map(str::to_string))
+        .find_map(|p| p.strip_prefix(&prefix).map(str::to_string))
 }
 
 #[cfg(test)]

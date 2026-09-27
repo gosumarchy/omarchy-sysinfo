@@ -50,7 +50,15 @@ fn run() -> Result<()> {
 
         if let Some(key) = input::next_key(&keys, Duration::from_millis(250)) {
             redraw = true;
-            app.on_key(key);
+            // Inside a filter, `r` is a character, not a refresh.
+            let batch = if app.filter.active {
+                vec![key]
+            } else {
+                input::coalesce_refresh(key, &keys)
+            };
+            for key in batch {
+                app.on_key(key);
+            }
         }
 
         if app.tick() {

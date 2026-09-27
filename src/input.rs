@@ -235,6 +235,24 @@ fn utf8_len(first: u8) -> usize {
     }
 }
 
+/// Collapse a run of `r` into one refresh, and let quit jump the queue.
+///
+/// A held key repeats faster than a collect finishes, so the channel fills
+/// with refreshes and `q` sits behind them until each one has blocked.
+pub fn coalesce_refresh(key: Key, rx: &Receiver<Key>) -> Vec<Key> {
+    if key != Key::Char('r') {
+        return vec![key];
+    }
+    while let Ok(next) = rx.try_recv() {
+        match next {
+            Key::Char('r') => {}
+            Key::Char('q') | Key::CtrlC | Key::Esc => return vec![next],
+            other => return vec![key, other],
+        }
+    }
+    vec![key]
+}
+
 /// Wait for a key, giving up after `timeout` so the caller can refresh.
 pub fn next_key(rx: &Receiver<Key>, timeout: Duration) -> Option<Key> {
     match rx.recv_timeout(timeout) {

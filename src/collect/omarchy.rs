@@ -1,6 +1,7 @@
 use super::{fs::read, units::dash, Row};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::OnceLock;
 
 const SHARE: &str = "/usr/share/omarchy";
 
@@ -85,24 +86,32 @@ fn home() -> PathBuf {
 }
 
 pub fn version() -> String {
-    let pkg = run("pacman", &["-Q", "omarchy"]).unwrap_or_default();
-    let built = pkg
-        .split_whitespace()
-        .nth(1)
-        .map(|v| v.to_string())
-        .unwrap_or_default();
-    let source = read(Path::new(SHARE).join("version")).unwrap_or_else(|| "unknown".into());
-    if built.is_empty() {
-        source
-    } else if built.starts_with(&source) {
-        built
-    } else {
-        format!("{built} (source {source})")
-    }
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let pkg = run("pacman", &["-Q", "omarchy"]).unwrap_or_default();
+            let built = pkg
+                .split_whitespace()
+                .nth(1)
+                .map(|v| v.to_string())
+                .unwrap_or_default();
+            let source = read(Path::new(SHARE).join("version")).unwrap_or_else(|| "unknown".into());
+            if built.is_empty() {
+                source
+            } else if built.starts_with(&source) {
+                built
+            } else {
+                format!("{built} (source {source})")
+            }
+        })
+        .clone()
 }
 
 pub fn channel() -> String {
-    run("omarchy-channel-current", &[]).unwrap_or_else(|| "unknown".into())
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED
+        .get_or_init(|| run("omarchy-channel-current", &[]).unwrap_or_else(|| "unknown".into()))
+        .clone()
 }
 
 fn update_setting() -> String {
@@ -143,17 +152,22 @@ fn last_update() -> String {
 }
 
 fn shell_state() -> String {
-    // Releases before 4 ran a process literally called omarchy-shell; 4 and
-    // later run the shell under quickshell.
-    if std::path::Path::new("/run/omarchy-shell").exists()
-        || run("pgrep", &["-x", "omarchy-shell"]).is_some()
-    {
-        return "omarchy-shell".into();
-    }
-    if run("pgrep", &["-x", "quickshell"]).is_some() {
-        return "quickshell (bar, menus)".into();
-    }
-    "not running".into()
+    static CACHED: OnceLock<String> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            // Releases before 4 ran a process literally called omarchy-shell; 4 and
+            // later run the shell under quickshell.
+            if std::path::Path::new("/run/omarchy-shell").exists()
+                || run("pgrep", &["-x", "omarchy-shell"]).is_some()
+            {
+                return "omarchy-shell".into();
+            }
+            if run("pgrep", &["-x", "quickshell"]).is_some() {
+                return "quickshell (bar, menus)".into();
+            }
+            "not running".into()
+        })
+        .clone()
 }
 
 fn compositor_version() -> String {
@@ -390,13 +404,18 @@ fn hooks() -> Vec<(String, String)> {
 
 /// Parses `omarchy menu keybindings --print`, which is the authoritative list.
 fn keybindings() -> Vec<(String, String)> {
-    let Ok(out) = Command::new("omarchy")
-        .args(["menu", "keybindings", "--print"])
-        .output()
-    else {
-        return Vec::new();
-    };
-    parse_keybindings(&String::from_utf8_lossy(&out.stdout))
+    static CACHED: OnceLock<Vec<(String, String)>> = OnceLock::new();
+    CACHED
+        .get_or_init(|| {
+            let Ok(out) = Command::new("omarchy")
+                .args(["menu", "keybindings", "--print"])
+                .output()
+            else {
+                return Vec::new();
+            };
+            parse_keybindings(&String::from_utf8_lossy(&out.stdout))
+        })
+        .clone()
 }
 
 /// Each line is `SUPER + I  →  open the launcher`; the arrow is a literal

@@ -1,8 +1,9 @@
-//! Terminal handling with no crates: raw mode via `stty`, and drawing with
-//! 24-bit ANSI escapes onto a cell buffer we own.
+//! Terminal handling with no crates: raw mode via `stty`, size via `TIOCGWINSZ`,
+//! and drawing with 24-bit ANSI escapes onto a cell buffer we own.
 
 use std::fmt::Write as _;
 use std::io::{self, Write};
+use std::os::raw::{c_int, c_ulong};
 use std::process::Command;
 
 use crate::collect::Bar;
@@ -282,8 +283,16 @@ fn stty(args: &[&str]) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Terminal size from `stty size`, falling back to the environment.
+/// Width and height: `TIOCGWINSZ`, then `stty size`, then the environment.
+///
+/// The ioctl is the path a redraw takes. `stty` stays only for a terminal that
+/// will not answer the syscall, so a resize still cannot fork on every frame.
 pub fn terminal_size() -> (u16, u16) {
+    for fd in [0, 1] {
+        if let Some(size) = ioctl_size(fd) {
+            return size;
+        }
+    }
     if let Some(out) = stty(&["size"]) {
         if let Some(size) = parse_size(&out) {
             return size;
@@ -292,12 +301,39 @@ pub fn terminal_size() -> (u16, u16) {
     (env_dim("COLUMNS", 100), env_dim("LINES", 30))
 }
 
+#[repr(C)]
+#[derive(Default)]
+struct Winsize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+const TIOCGWINSZ: c_ulong = 0x5413;
+
+extern "C" {
+    fn ioctl(fd: c_int, request: c_ulong, arg: *mut Winsize) -> c_int;
+}
+
+fn ioctl_size(fd: i32) -> Option<(u16, u16)> {
+    let mut size = Winsize::default();
+    if unsafe { ioctl(fd, TIOCGWINSZ, &mut size) } < 0 {
+        return None;
+    }
+    size_if_nonzero(size.ws_col, size.ws_row)
+}
+
+fn size_if_nonzero(cols: u16, rows: u16) -> Option<(u16, u16)> {
+    (cols > 0 && rows > 0).then_some((cols, rows))
+}
+
 /// `stty size` prints rows then columns, but we want width first.
 fn parse_size(text: &str) -> Option<(u16, u16)> {
     let mut parts = text.split_whitespace();
     let rows = parts.next()?.parse::<u16>().ok()?;
     let cols = parts.next()?.parse::<u16>().ok()?;
-    (rows > 0 && cols > 0).then_some((cols, rows))
+    size_if_nonzero(cols, rows)
 }
 
 /// Environment dimensions are only a hint, so a zero or unparsable value must
@@ -689,6 +725,18 @@ mod tests {
         // `stty size` prints "rows cols"; we want (width, height).
         assert_eq!(parse_size("24 80"), Some((80, 24)));
         assert_eq!(parse_size(" 50  120 \n"), Some((120, 50)));
+    }
+
+    #[test]
+    fn a_zero_dimension_is_not_a_terminal_size() {
+        assert_eq!(size_if_nonzero(80, 24), Some((80, 24)));
+        assert_eq!(size_if_nonzero(0, 24), None);
+        assert_eq!(size_if_nonzero(80, 0), None);
+    }
+
+    #[test]
+    fn ioctl_size_rejects_a_fd_that_is_not_a_terminal() {
+        assert_eq!(ioctl_size(-1), None);
     }
 
     #[test]

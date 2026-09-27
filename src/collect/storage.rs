@@ -7,6 +7,7 @@ use std::path::Path;
 
 pub fn rows() -> Vec<Row> {
     let mounts = mount_table();
+    let usage = usage_table();
     let mut rows = Vec::new();
     let mut disks = 0usize;
 
@@ -56,14 +57,14 @@ pub fn rows() -> Vec<Row> {
 
         let mut mounted: Vec<String> = mounts
             .iter()
-            .filter(|(dev, _, _)| device_matches(dev, &name))
-            .map(|(_, fstype, point)| format!("{point} ({fstype})"))
+            .filter(|m| m.matches(&name))
+            .map(|m| format!("{} ({})", m.point, m.fstype))
             .collect();
         mounted.sort();
         let usage = mounts
             .iter()
-            .find(|(dev, _, _)| device_matches(dev, &name))
-            .and_then(|(dev, _, _)| disk_usage(dev));
+            .find(|m| m.matches(&name))
+            .and_then(|m| disk_usage(&usage, &m.dev));
 
         rows.push(Row::Header(format!("{name}  ·  {rotational_label}")));
         rows.push(Row::field("Capacity", human_bytes(size)));
@@ -112,13 +113,13 @@ pub fn rows() -> Vec<Row> {
                 .unwrap_or(0);
             let fstype = mounts
                 .iter()
-                .find(|(dev, _, _)| device_matches(dev, &part))
-                .map(|(_, fs, _)| fs.clone())
+                .find(|m| m.matches(&part))
+                .map(|m| m.fstype.clone())
                 .unwrap_or_else(|| "-".into());
             let point = mounts
                 .iter()
-                .find(|(dev, _, _)| device_matches(dev, &part))
-                .map(|(_, _, p)| p.clone())
+                .find(|m| m.matches(&part))
+                .map(|m| m.point.clone())
                 .unwrap_or_else(|| "-".into());
             rows.push(Row::field(
                 format!("  {part}"),
@@ -166,16 +167,51 @@ fn dash_opt(v: Option<String>) -> String {
     }
 }
 
-type Mounts = Vec<(String, String, String)>;
+struct Mount {
+    dev: String,
+    /// Basename of the mount source, and of its canonical path when that differs.
+    /// Resolved once, so matching a disk does not `canonicalize` per comparison.
+    names: [String; 2],
+    fstype: String,
+    point: String,
+}
 
-fn mount_table() -> Mounts {
-    match read("/proc/mounts") {
-        Some(content) => parse_mounts(&content),
-        None => Vec::new(),
+impl Mount {
+    fn matches(&self, name: &str) -> bool {
+        self.names.iter().any(|n| name_matches(n, name))
     }
 }
 
-fn parse_mounts(content: &str) -> Mounts {
+fn mount_table() -> Vec<Mount> {
+    let Some(content) = read("/proc/mounts") else {
+        return Vec::new();
+    };
+    parse_mounts(&content)
+        .into_iter()
+        .map(|(dev, fstype, point)| {
+            let direct = file_name(&dev);
+            let resolved = std::fs::canonicalize(&dev)
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| direct.clone());
+            Mount {
+                dev,
+                names: [direct, resolved],
+                fstype,
+                point,
+            }
+        })
+        .collect()
+}
+
+fn file_name(path: &str) -> String {
+    Path::new(path)
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string())
+}
+
+fn parse_mounts(content: &str) -> Vec<(String, String, String)> {
     content
         .lines()
         .filter_map(|l| {
@@ -195,16 +231,16 @@ fn parse_mounts(content: &str) -> Mounts {
 /// octal. Decoding only `\040` left paths containing a literal backslash or
 /// newline showing their escape sequence in the UI.
 fn unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let bytes: Vec<char> = s.chars().collect();
+    let bytes = s.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
-        if bytes[i] == '\\' && i + 3 < bytes.len() {
-            let digits: String = bytes[i + 1..i + 4].iter().collect();
-            if digits.len() == 3 && digits.chars().all(|c| ('0'..='7').contains(&c)) {
-                if let Ok(byte) = u8::from_str_radix(&digits, 8) {
-                    // Multi-byte UTF-8 is escaped byte by byte, so rebuild it.
-                    out.push(byte as char);
+        if bytes[i] == b'\\' && i + 3 < bytes.len() {
+            let digits = &bytes[i + 1..i + 4];
+            if digits.iter().all(|c| (b'0'..=b'7').contains(c)) {
+                if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(digits).unwrap_or(""), 8) {
+                    // The kernel escapes each byte of a multi-byte UTF-8 sequence.
+                    out.push(byte);
                     i += 4;
                     continue;
                 }
@@ -213,27 +249,59 @@ fn unescape(s: &str) -> String {
         out.push(bytes[i]);
         i += 1;
     }
-    out
+    String::from_utf8_lossy(&out).into_owned()
 }
 
-/// `/proc/mounts` names the device the user sees, which for LVM or btrfs is a
-/// symlink like `/dev/mapper/root`. Resolve it so it matches `/sys/block/dm-0`.
-fn device_matches(device: &str, name: &str) -> bool {
-    let base = |s: &str| {
-        Path::new(s)
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_else(|| s.to_string())
+fn disk_usage(table: &[Usage], device: &str) -> Option<(String, String, f64)> {
+    let want = file_name(device);
+    if let Some(row) = table
+        .iter()
+        .find(|u| u.source == device || file_name(&u.source) == want)
+    {
+        return Some((row.used.clone(), row.avail.clone(), row.pct));
+    }
+    df_device(device)
+}
+
+struct Usage {
+    source: String,
+    used: String,
+    avail: String,
+    pct: f64,
+}
+
+/// One `df` for every filesystem. A per-device call forks once per disk.
+fn usage_table() -> Vec<Usage> {
+    let Ok(out) = std::process::Command::new("df")
+        .args(["-B1", "--output=source,size,used,avail,pcent"])
+        .output()
+    else {
+        return Vec::new();
     };
-    if name_matches(&base(device), name) {
-        return true;
-    }
-    if let Ok(resolved) = std::fs::canonicalize(device) {
-        if name_matches(&base(&resolved.to_string_lossy()), name) {
-            return true;
-        }
-    }
-    false
+    let Ok(text) = String::from_utf8(out.stdout) else {
+        return Vec::new();
+    };
+    parse_df_table(&text)
+}
+
+fn parse_df_table(text: &str) -> Vec<Usage> {
+    text.lines()
+        .skip(1)
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let source = parts.next()?.to_string();
+            let _size = parts.next()?;
+            let used = parts.next()?.parse().ok()?;
+            let avail = parts.next()?.parse().ok()?;
+            let pct = parts.next()?.trim_end_matches('%').parse().ok()?;
+            Some(Usage {
+                source,
+                used: human_bytes(used),
+                avail: human_bytes(avail),
+                pct,
+            })
+        })
+        .collect()
 }
 
 /// Whether a mount source refers to `name` or to one of its partitions.
@@ -253,7 +321,7 @@ fn name_matches(base: &str, name: &str) -> bool {
     digits(rest) || rest.strip_prefix('p').is_some_and(digits)
 }
 
-fn disk_usage(device: &str) -> Option<(String, String, f64)> {
+fn df_device(device: &str) -> Option<(String, String, f64)> {
     let out = std::process::Command::new("df")
         .args(["-B1", "--output=size,used,avail,pcent", device])
         .output()
@@ -314,10 +382,8 @@ fn parse_btrfs(text: &str) -> Option<String> {
         .lines()
         .filter(|l| l.trim_start().starts_with("devid") || l.contains(" path /dev/"))
         .count();
-    Some(format!(
-        "label {:?}, {devices} device(s)",
-        if label == "none" { "<none>" } else { &label }
-    ))
+    let shown = if label == "none" { "<none>" } else { &label };
+    Some(format!("label {shown}, {devices} device(s)"))
 }
 
 fn smart_summary(block: &Path) -> Option<String> {
@@ -368,6 +434,8 @@ mod tests {
         assert_eq!(unescape("/mnt/tab\\011here"), "/mnt/tab\there");
         // A backslash is escaped as a backslash.
         assert_eq!(unescape("/mnt/back\\134slash"), "/mnt/back\\slash");
+        // é is the two bytes c3 a9. Pushing each as a char produced "Ã©".
+        assert_eq!(unescape("/mnt/caf\\303\\251"), "/mnt/café");
     }
 
     #[test]

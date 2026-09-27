@@ -4,6 +4,7 @@ use super::{
     Row,
 };
 use std::path::Path;
+use std::sync::OnceLock;
 
 /// Firmware identity straight out of `/sys/class/dmi/id`. Laptop vendors rename
 /// these boards, so the product code is usually more honest than the name.
@@ -23,6 +24,11 @@ const FIELDS: &[(&str, &str)] = &[
 ];
 
 pub fn rows() -> Vec<Row> {
+    static CACHED: OnceLock<Vec<Row>> = OnceLock::new();
+    CACHED.get_or_init(load_rows).clone()
+}
+
+fn load_rows() -> Vec<Row> {
     let base = Path::new("/sys/class/dmi/id");
     let mut rows = Vec::new();
     let mut exposed = false;
@@ -115,11 +121,11 @@ const EFI_HEADER: usize = 4;
 
 /// Whether the firmware has Secure Boot turned on.
 fn secure_boot_state() -> Option<String> {
-    secure_boot_from(&read(Path::new(SECURE_BOOT_VAR))?)
+    secure_boot_from(&super::fs::read_bytes(SECURE_BOOT_VAR)?)
 }
 
-fn secure_boot_from(raw: &str) -> Option<String> {
-    match raw.as_bytes().get(EFI_HEADER)? {
+fn secure_boot_from(raw: &[u8]) -> Option<String> {
+    match raw.get(EFI_HEADER)? {
         0x01 => Some("enabled".into()),
         _ => Some("disabled".into()),
     }
@@ -132,11 +138,11 @@ fn secure_boot_from(raw: &str) -> Option<String> {
 /// "binary file matches" and paste a loader description into a bug report as a
 /// wall of NULs.
 fn efi_text(path: &str) -> Option<String> {
-    efi_text_from(&read(Path::new(path))?)
+    efi_text_from(&super::fs::read_bytes(path)?)
 }
 
-fn efi_text_from(raw: &str) -> Option<String> {
-    let payload = raw.as_bytes().get(EFI_HEADER..)?;
+fn efi_text_from(raw: &[u8]) -> Option<String> {
+    let payload = raw.get(EFI_HEADER..)?;
 
     // An odd trailing byte cannot be a UTF-16 unit; `chunks_exact` drops it
     // rather than let from_utf16_lossy put a replacement character in the
@@ -251,15 +257,19 @@ mod tests {
         // Read as bytes it was "L\0i\0m\0i\0n\0e\0", and every NUL made grep
         // treat the whole report as a binary file.
         let raw = efivar(&utf16("Limine 12.8.0\0"));
-        assert_eq!(efi_text_from(&raw), Some("Limine 12.8.0".into()));
+        assert_eq!(efi_text_from(raw.as_bytes()), Some("Limine 12.8.0".into()));
     }
 
     #[test]
     fn a_text_efivar_with_no_header_or_no_text_is_absent() {
-        assert_eq!(efi_text_from(""), None, "too short to hold a header");
-        assert_eq!(efi_text_from(&efivar(&[])), None, "header but no data");
+        assert_eq!(efi_text_from(b""), None, "too short to hold a header");
         assert_eq!(
-            efi_text_from(&efivar(&utf16("\0\0"))),
+            efi_text_from(efivar(&[]).as_bytes()),
+            None,
+            "header but no data"
+        );
+        assert_eq!(
+            efi_text_from(efivar(&utf16("\0\0")).as_bytes()),
             None,
             "all NUL is no value"
         );
@@ -269,7 +279,7 @@ mod tests {
     fn an_odd_trailing_byte_does_not_become_a_replacement_character() {
         let mut data = utf16("ab");
         data.push(0x41);
-        let text = efi_text_from(&efivar(&data)).unwrap();
+        let text = efi_text_from(efivar(&data).as_bytes()).unwrap();
         assert_eq!(text, "ab", "half a UTF-16 unit is dropped, not mangled");
     }
 
@@ -277,14 +287,27 @@ mod tests {
     fn secure_boot_reads_the_byte_after_the_header() {
         // The bug: the check looked at the first attribute byte, so an enabled
         // machine still reported "disabled".
-        assert_eq!(secure_boot_from(&efivar(&[0x01])), Some("enabled".into()));
-        assert_eq!(secure_boot_from(&efivar(&[0x00])), Some("disabled".into()));
-        assert_eq!(secure_boot_from(&efivar(&[0x02])), Some("disabled".into()));
+        assert_eq!(
+            secure_boot_from(efivar(&[0x01]).as_bytes()),
+            Some("enabled".into())
+        );
+        assert_eq!(
+            secure_boot_from(efivar(&[0x00]).as_bytes()),
+            Some("disabled".into())
+        );
+        assert_eq!(
+            secure_boot_from(efivar(&[0x02]).as_bytes()),
+            Some("disabled".into())
+        );
     }
 
     #[test]
     fn secure_boot_is_absent_without_the_variable() {
-        assert_eq!(secure_boot_from(""), None);
-        assert_eq!(secure_boot_from(&efivar(&[])), None, "no data byte");
+        assert_eq!(secure_boot_from(b""), None);
+        assert_eq!(
+            secure_boot_from(efivar(&[]).as_bytes()),
+            None,
+            "no data byte"
+        );
     }
 }
