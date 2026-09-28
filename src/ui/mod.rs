@@ -1,19 +1,37 @@
-pub mod theme;
+//! Drawing the app onto a [`Buffer`]: header, sidebar, detail pane, footer,
+//! and the help overlay. Pure layout; the state lives in [`App`].
 
-use crate::app::{App, Focus};
+pub(crate) mod theme;
+
+use crate::app::{App, Focus, Mode};
 use crate::collect::{Bar, Row};
 use crate::term::{Buffer, Style};
-use theme::{heat, Palette};
+use crate::text::{clip, width as text_width};
+use theme::{Palette, heat};
+
+/// The smallest terminal the layout draws into.
+const MIN_WIDTH: u16 = 20;
+const MIN_HEIGHT: u16 = 6;
+
+/// Columns the gauge and its percentage take at the right edge.
+const GAUGE_COLUMN: u16 = 12;
+const GAUGE_WIDTH: u16 = 4;
 
 /// Sidebar width, narrowed on small terminals so the detail pane survives.
 fn sidebar_width(width: u16) -> u16 {
     (width / 3).clamp(12, 24)
 }
 
-pub fn draw(buffer: &mut Buffer, app: &App, palette: &Palette) {
+/// How many detail rows fit in a terminal `height` rows tall: everything but
+/// the header, the pane's title rule and the footer.
+pub(crate) fn detail_rows(height: u16) -> usize {
+    usize::from(height.saturating_sub(3))
+}
+
+pub(crate) fn draw(buffer: &mut Buffer, app: &App, palette: &Palette) {
     let width = buffer.width();
     let height = buffer.height();
-    if width < 20 || height < 6 {
+    if width < MIN_WIDTH || height < MIN_HEIGHT {
         let style = Style::new(palette.muted);
         buffer.put(1, 1, "terminal too small — resize to at least 20x6", style);
 
@@ -22,35 +40,44 @@ pub fn draw(buffer: &mut Buffer, app: &App, palette: &Palette) {
 
     let body_top = 1u16;
     let footer_row = height - 1;
-    let body_height = footer_row.saturating_sub(body_top);
+    let body_height = footer_row - body_top;
     let sidebar = sidebar_width(width);
 
-    header(buffer, width, app, palette);
-    sidebar_pane(buffer, 0, body_top, body_height, sidebar, app, palette);
+    header(buffer, app, palette);
+    sidebar_pane(buffer, body_top, body_height, sidebar, app, palette);
     detail(buffer, sidebar, body_top, body_height, app, palette);
-    footer(buffer, width, footer_row, app, palette);
+    footer(buffer, footer_row, app, palette);
 
-    if app.show_help {
-        help(buffer, app, palette);
+    if app.mode() == Mode::Help {
+        help(buffer, palette);
     }
 }
 
-fn header(buffer: &mut Buffer, width: u16, app: &App, palette: &Palette) {
-    let title = " omarchy-sysinfo ";
+fn header(buffer: &mut Buffer, app: &App, palette: &Palette) {
+    let width = buffer.width();
     let badge = Style::new(palette.background).on(palette.accent).bold();
-    let mut x = buffer.put(0, 0, title, badge);
-    x += 1;
+    let mut x = buffer.put(0, 0, " omarchy-sysinfo ", badge) + 1;
 
-    let hostname_style = Style::new(palette.foreground).bold();
-    x = buffer.put(x, 0, &app.hostname, hostname_style);
-    x += 2;
-
-    let uptime = crate::collect::units::human_secs(app.stats.uptime());
-    let meta_style = Style::new(palette.muted);
-    let meta = format!("· {} · uptime {}", app.kernel, uptime);
-    let room = width.saturating_sub(x + 1) as usize;
-    if meta.chars().count() <= room {
-        buffer.put(x, 0, &meta, meta_style);
+    match app.snapshot() {
+        Some(snapshot) => {
+            x = buffer.put(
+                x,
+                0,
+                &snapshot.hostname,
+                Style::new(palette.foreground).bold(),
+            ) + 2;
+            let meta = format!(
+                "· {} · uptime {}",
+                snapshot.kernel,
+                crate::collect::units::human_secs(snapshot.uptime)
+            );
+            if text_width(&meta) < usize::from(width.saturating_sub(x)) {
+                buffer.put(x, 0, &meta, Style::new(palette.muted));
+            }
+        }
+        None => {
+            buffer.put(x, 0, "collecting…", Style::new(palette.muted));
+        }
     }
 
     buffer.hline(0, 1, width, '─', Style::new(palette.muted).dim());
@@ -58,275 +85,286 @@ fn header(buffer: &mut Buffer, width: u16, app: &App, palette: &Palette) {
 
 fn sidebar_pane(
     buffer: &mut Buffer,
-    x: u16,
     top: u16,
     height: u16,
     width: u16,
     app: &App,
     palette: &Palette,
 ) {
-    let focused = app.focus == Focus::Sections;
-    let border = Style::new(if focused {
-        palette.accent
-    } else {
-        palette.muted
+    let border = Style::new(match app.focus() {
+        Focus::Sections => palette.accent,
+        Focus::Detail => palette.muted,
     })
     .dim();
-
-    let visible = height.saturating_sub(1) as usize;
-    let selected = app.selected;
+    let sections = app.sections();
+    // Rows below the pane's title, `top + 1` up to the row above the footer.
+    let rows = usize::from(height.saturating_sub(1));
+    // When the list does not fit, its last row says how much is missing.
+    let overflow = sections.len() > rows;
+    let visible = if overflow {
+        rows.saturating_sub(1)
+    } else {
+        rows
+    };
+    let selected = app.selected();
 
     // Scroll the sidebar so the selection stays on screen.
-    let mut start = 0usize;
-    if selected >= visible {
-        start = selected + 1 - visible;
-    }
+    let start = (selected + 1).saturating_sub(visible);
 
-    for (row, index) in (start..app.sections.len()).take(visible).enumerate() {
-        let y = top + 1 + row as u16;
+    for (y, (index, section)) in
+        (top + 1..).zip(sections.iter().enumerate().skip(start).take(visible))
+    {
         let is_selected = index == selected;
-        let style = if is_selected {
-            Style::new(palette.background).on(palette.accent).bold()
+        let (marker, style) = if is_selected {
+            (
+                "▸ ",
+                Style::new(palette.background).on(palette.accent).bold(),
+            )
         } else {
-            Style::new(palette.foreground)
+            ("  ", Style::new(palette.foreground))
         };
-        let text = if is_selected {
-            format!("▸ {}", app.sections[index].title)
-        } else {
-            format!("  {}", app.sections[index].title)
-        };
-        buffer.put(x, y, &text, style);
+        let room = usize::from(width.saturating_sub(1));
+        let text = clip(&format!("{marker}{}", section.title), room);
+        let end = buffer.put(0, y, &text, style);
         if is_selected {
             // Extend the highlight across the rest of the sidebar.
-            let from = x + text.chars().count().min(width as usize - 1) as u16;
-            for col in from..width - 1 {
-                buffer.put(col, y, " ", style);
-            }
+            buffer.hline(end, y, width - 1, ' ', style);
         }
     }
 
-    if app.sections.len() > visible {
-        let more = format!("  +{} more", app.sections.len() - visible);
-        let y = top + height;
-        buffer.put(x + 1, y, &more, Style::new(palette.muted).dim());
+    // The hint used to be drawn at `top + height`, which is the footer row,
+    // and the footer then painted over it, so it never appeared.
+    if overflow && height >= 2 {
+        let more = format!(" +{} more", sections.len() - visible);
+        let room = usize::from(width.saturating_sub(1));
+        buffer.put(
+            0,
+            top + height - 1,
+            &clip(&more, room),
+            Style::new(palette.muted).dim(),
+        );
     }
 
     buffer.vline(width - 1, top, top + height, '│', border);
-    buffer.put(x, top, " sections ", Style::new(palette.muted).dim());
+    buffer.put(0, top, " sections ", Style::new(palette.muted).dim());
+}
+
+/// One rendered line of the detail pane, borrowing from the snapshot.
+enum Line<'a> {
+    Text(String, Style),
+    Field {
+        label: &'a str,
+        value: &'a str,
+        style: Style,
+        /// The gauge travels as a `Bar` rather than a bare ratio, so the
+        /// clamped invariant survives all the way to the renderer.
+        bar: Option<Bar>,
+    },
+    Blank,
+}
+
+fn line<'a>(row: &'a Row, palette: &Palette) -> Line<'a> {
+    match row {
+        Row::Header(text) => Line::Text(format!("▌ {text}"), Style::new(palette.heading).bold()),
+        Row::Note(text) => Line::Text(format!("  {text}"), Style::new(palette.muted)),
+        Row::Blank => Line::Blank,
+        Row::Field {
+            label, value, bar, ..
+        } => Line::Field {
+            label,
+            value,
+            style: Style::new(bar.map_or(palette.foreground, |b| heat(b.frac(), palette))),
+            bar: *bar,
+        },
+    }
 }
 
 fn detail(buffer: &mut Buffer, x: u16, top: u16, height: u16, app: &App, palette: &Palette) {
-    let section = app.section();
-    let total = app.detail_len();
     let width = buffer.width();
-    let inner_width = width.saturating_sub(x + 1) as usize;
-    let inner_height = height.saturating_sub(1) as usize;
+    let inner_width = usize::from(width.saturating_sub(x + 1));
+    let inner_height = usize::from(height.saturating_sub(1));
+    let rows = app.visible_rows();
+    let total = rows.len();
 
     buffer.hline(x, top, width, '─', Style::new(palette.muted).dim());
     let range = if total == 0 {
         "no rows".to_string()
     } else {
-        let first = (app.scroll as usize + 1).min(total);
-        let last = (first + inner_height).min(total);
+        let first = app.scroll() + 1;
+        let last = (app.scroll() + inner_height).min(total);
         format!("{first}-{last} of {total}")
     };
-    let title = format!(" {}  {} ", section.title.to_lowercase(), range);
-    buffer.put(x, top, &title, Style::new(palette.accent).bold());
+    let title = app.section().map_or_else(
+        || "waiting for the first reading".into(),
+        |s| s.title.to_lowercase(),
+    );
+    buffer.put(
+        x,
+        top,
+        &clip(&format!(" {title}  {range} "), inner_width),
+        Style::new(palette.accent).bold(),
+    );
 
-    if inner_width < 10 || inner_height == 0 {
+    if inner_width < 10 || inner_height == 0 || app.section().is_none() {
         return;
     }
-
-    // Build the visible rows, keeping the label and value apart so each can
-    // take its own colour.
-    let visible_rows: Vec<&Row> = section
-        .rows
-        .iter()
-        .filter(|r| app.filter.matches(r))
-        .collect();
-    let label_width = visible_rows
-        .iter()
-        .filter_map(|r| match r {
-            Row::Field { label, .. } => Some(label.chars().count() + 2),
-            _ => None,
-        })
-        .max()
-        .unwrap_or(14)
-        .clamp(10, 32);
-
-    /// One rendered line: either plain text, or a label/value pair.
-    enum Line {
-        Text(String, Style),
-        /// The gauge travels as a `Bar` rather than a bare ratio, so the
-        /// clamped invariant survives all the way to the renderer.
-        Field(String, String, Style, Option<Bar>),
-        Blank,
-    }
-
-    let mut lines: Vec<Line> = Vec::new();
-    for row in &visible_rows {
-        match row {
-            Row::Header(text) => {
-                lines.push(Line::Text(
-                    format!("▌ {text}"),
-                    Style::new(palette.heading).bold(),
-                ));
-            }
-            Row::Blank => lines.push(Line::Blank),
-            Row::Note(text) => {
-                lines.push(Line::Text(format!("  {text}"), Style::new(palette.muted)));
-            }
-            Row::Field { label, value, bar } => {
-                let style = match bar {
-                    Some(b) => Style::new(heat(b.frac(), palette)),
-                    None => Style::new(palette.foreground),
-                };
-                lines.push(Line::Field(
-                    format!("  {label}"),
-                    value.clone(),
-                    style,
-                    bar.clone(),
-                ));
-            }
-        }
-    }
-
-    // The gauge column sits on the right, reserved from the value text.
-    let gauge_x = width.saturating_sub(12);
-    let value_x = x + label_width as u16 + 2;
-    // Leave a gap so a long value never butts up against the gauge.
-    let value_room = (gauge_x.saturating_sub(value_x) as usize)
-        .saturating_sub(2)
-        .max(4);
-    // On a narrow terminal there is no room for a label column and a value
-    // column side by side, so fall back to one line per row.
-    let paired = (value_x as usize + 8) <= width as usize;
-
-    let start = app.scroll as usize;
-    // Clamp against the viewport, not just the row count: `max_scroll` is
-    // row-count based, so on a tall pane it allowed scrolling until the last
-    // row sat at the top and the rest of the pane was empty.
-    let start = start.min(lines.len().saturating_sub(inner_height));
-    for (offset, line) in lines.iter().skip(start).take(inner_height).enumerate() {
-        let y = top + 1 + offset as u16;
-        match line {
-            Line::Blank => {}
-            Line::Text(text, style) => {
-                buffer.put(x, y, &clip(text, inner_width), *style);
-            }
-            Line::Field(label, value, style, bar) => {
-                // With a gauge on the right, a percentage already in the value
-                // would just be printed twice.
-                let text = if bar.is_some() {
-                    strip_percent(value)
-                } else {
-                    value.clone()
-                };
-                if paired {
-                    // Clip the label rather than let it run into the value column.
-                    buffer.put(x, y, &clip(label, label_width), Style::new(palette.muted));
-                    buffer.put(value_x, y, &clip(&text, value_room), *style);
-                } else {
-                    // Too narrow for two columns: keep the value on the label's
-                    // own row, and give up the gauge.
-                    buffer.put(
-                        x,
-                        y,
-                        &clip(label, inner_width / 2),
-                        Style::new(palette.muted),
-                    );
-                    let after = x + (inner_width / 2) as u16 + 2;
-                    let room = width.saturating_sub(after) as usize;
-                    buffer.put(after, y, &clip(&text, room.max(1)), *style);
-                    continue;
-                }
-                if let Some(bar) = bar {
-                    let frac = bar.frac();
-                    buffer.gauge(
-                        gauge_x,
-                        y,
-                        4,
-                        bar.clone(),
-                        Style::new(heat(frac, palette)),
-                        Style::new(palette.muted).dim(),
-                    );
-                    buffer.put_right(
-                        gauge_x + 6,
-                        y,
-                        &format!("{:.0}%", frac * 100.0),
-                        Style::new(heat(frac, palette)),
-                    );
-                }
-            }
-        }
-    }
-
-    if lines.is_empty() {
+    if rows.is_empty() {
         buffer.put(
             x + 1,
             top + 1,
             "no rows match the filter",
             Style::new(palette.muted),
         );
+
+        return;
+    }
+
+    let label_width = rows
+        .iter()
+        .filter_map(|r| match r {
+            Row::Field { label, .. } => Some(text_width(label) + 2),
+            Row::Header(_) | Row::Note(_) | Row::Blank => None,
+        })
+        .max()
+        .unwrap_or(14)
+        .clamp(10, 32);
+
+    let layout = Layout::new(x, width, label_width);
+    let lines = rows.iter().map(|row| line(row, palette));
+    for (y, line) in (top + 1..).zip(lines.skip(app.scroll()).take(inner_height)) {
+        match line {
+            Line::Blank => {}
+            Line::Text(text, style) => {
+                buffer.put(x, y, &clip(&text, inner_width), style);
+            }
+            Line::Field {
+                label,
+                value,
+                style,
+                bar,
+            } => field(buffer, &layout, y, (label, value, style, bar), palette),
+        }
     }
 }
 
-/// Longest prefix of `text` that fits in `width` columns.
-fn clip(text: &str, width: usize) -> String {
-    if width == 0 {
-        // A zero-width column has no room for the ellipsis either.
-        return String::new();
-    }
-    if text.chars().count() <= width {
-        return text.to_string();
-    }
-    let mut out = String::new();
-    for (i, ch) in text.chars().enumerate() {
-        if i == width - 1 {
-            out.push('…');
-            break;
+/// Where the columns of a field row go at this width.
+struct Layout {
+    x: u16,
+    width: u16,
+    label_width: usize,
+    value_x: u16,
+    value_room: usize,
+    gauge_x: u16,
+    /// On a narrow terminal there is no room for a label column and a value
+    /// column side by side, so each row falls back to a half-and-half split.
+    paired: bool,
+}
+
+impl Layout {
+    fn new(x: u16, width: u16, label_width: usize) -> Layout {
+        let gauge_x = width.saturating_sub(GAUGE_COLUMN);
+        let value_x = x.saturating_add(u16::try_from(label_width + 2).unwrap_or(u16::MAX));
+        // Leave a gap so a long value never butts up against the gauge.
+        let value_room = usize::from(gauge_x.saturating_sub(value_x))
+            .saturating_sub(2)
+            .max(4);
+
+        Layout {
+            x,
+            width,
+            label_width,
+            value_x,
+            value_room,
+            gauge_x,
+            paired: usize::from(value_x) + 8 <= usize::from(width),
         }
-        out.push(ch);
     }
-    out
+}
+
+fn field(
+    buffer: &mut Buffer,
+    layout: &Layout,
+    y: u16,
+    (label, value, style, bar): (&str, &str, Style, Option<Bar>),
+    palette: &Palette,
+) {
+    let label = format!("  {label}");
+    // With a gauge on the right, a percentage already in the value would
+    // just be printed twice.
+    let value = if bar.is_some() {
+        strip_percent(value)
+    } else {
+        value
+    };
+    let label_style = Style::new(palette.muted);
+
+    if !layout.paired {
+        let half = usize::from(layout.width.saturating_sub(layout.x + 1)) / 2;
+        buffer.put(layout.x, y, &clip(&label, half), label_style);
+        let after = layout.x + u16::try_from(half).unwrap_or(u16::MAX) + 2;
+        let room = usize::from(layout.width.saturating_sub(after)).max(1);
+        buffer.put(after, y, &clip(value, room), style);
+
+        return;
+    }
+
+    // Clip the label rather than let it run into the value column.
+    buffer.put(layout.x, y, &clip(&label, layout.label_width), label_style);
+    buffer.put(layout.value_x, y, &clip(value, layout.value_room), style);
+
+    if let Some(bar) = bar {
+        let heat_style = Style::new(heat(bar.frac(), palette));
+        buffer.gauge(
+            layout.gauge_x,
+            y,
+            GAUGE_WIDTH,
+            bar,
+            heat_style,
+            Style::new(palette.muted).dim(),
+        );
+        buffer.put_right(
+            layout.gauge_x + GAUGE_WIDTH + 2,
+            y,
+            &format!("{}%", bar.percent()),
+            heat_style,
+        );
+    }
 }
 
 /// Drop a percentage the gauge column already shows, so it is not printed twice.
-fn strip_percent(value: &str) -> String {
+fn strip_percent(value: &str) -> &str {
     let trimmed = value.trim();
     // A value that is nothing but a percentage is fully covered by the gauge.
     if is_percent(trimmed) {
-        return String::new();
+        return "";
     }
     // Otherwise drop a leading "45% " and keep whatever followed it.
-    if let Some((first, rest)) = trimmed.split_once(' ') {
-        if is_percent(first) {
-            return rest.trim_start().to_string();
-        }
+    match trimmed.split_once(' ') {
+        Some((first, rest)) if is_percent(first) => rest.trim_start(),
+        _ => value,
     }
-    value.to_string()
 }
 
 fn is_percent(token: &str) -> bool {
     let Some(digits) = token.strip_suffix('%') else {
         return false;
     };
+
     // At least one real digit, so "..%" and "%" are not mistaken for a value.
-    !digits.is_empty()
-        && digits.chars().all(|c| c.is_ascii_digit() || c == '.')
+    digits.chars().all(|c| c.is_ascii_digit() || c == '.')
         && digits.chars().any(|c| c.is_ascii_digit())
 }
 
-fn footer(buffer: &mut Buffer, width: u16, y: u16, app: &App, palette: &Palette) {
+fn footer(buffer: &mut Buffer, y: u16, app: &App, palette: &Palette) {
+    let width = buffer.width();
     let key = Style::new(palette.accent);
     let hint = Style::new(palette.muted);
-    let mut x = 0;
 
     buffer.fill_row(y, ' ', Style::new(palette.muted).on(palette.background));
 
-    if app.filter.active {
-        x = buffer.put(x, y, " /", key);
-        x = buffer.put(x, y, &app.filter.query, Style::new(palette.foreground));
+    if app.mode() == Mode::Filter {
+        let mut x = buffer.put(0, y, " /", key);
+        x = buffer.put(x, y, app.filter().query(), Style::new(palette.foreground));
         x = buffer.put(x, y, "▏", key);
         buffer.put(x + 1, y, "enter to apply · esc to clear", hint);
 
@@ -334,10 +372,11 @@ fn footer(buffer: &mut Buffer, width: u16, y: u16, app: &App, palette: &Palette)
     }
 
     // ↑↓ means different things depending on which pane has focus, so say so.
-    let move_hint = match app.focus {
-        crate::app::Focus::Sections => " section  ",
-        crate::app::Focus::Detail => " scroll  ",
+    let move_hint = match app.focus() {
+        Focus::Sections => " section  ",
+        Focus::Detail => " scroll  ",
     };
+    let mut x = 0;
     for (k, d) in [
         (" q", " quit  "),
         ("↑↓", move_hint),
@@ -346,80 +385,79 @@ fn footer(buffer: &mut Buffer, width: u16, y: u16, app: &App, palette: &Palette)
         ("r", " refresh  "),
         ("?", " help  "),
     ] {
-        if x + k.chars().count() as u16 + d.chars().count() as u16 > width {
+        if usize::from(x) + text_width(k) + text_width(d) > usize::from(width) {
             break;
         }
         x = buffer.put(x, y, k, key);
         x = buffer.put(x, y, d, hint);
     }
 
-    if !app.status.is_empty() {
-        buffer.put_right(width, y, &app.status, Style::new(palette.green));
+    if let Some(status) = app.status() {
+        buffer.put_right(width, y, status, Style::new(palette.green));
     }
 }
 
-fn help(buffer: &mut Buffer, app: &App, palette: &Palette) {
-    let entries: [(&str, &str); 9] = [
+fn help(buffer: &mut Buffer, palette: &Palette) {
+    const ENTRIES: [(&str, &str); 9] = [
         ("q / esc", "quit"),
-        ("↑ ↓  or  j k", "previous or next section"),
+        ("↑ ↓  or  j k", "previous or next section, or scroll"),
         ("g / G", "jump to the first or last section"),
-        ("pgup / pgdn", "scroll the detail pane by ten rows"),
+        ("pgup / pgdn", "scroll the detail pane a page"),
         ("← →  or  h l", "move between the sidebar and the detail"),
         ("tab", "swap panes"),
         ("/", "filter rows by substring"),
         ("r", "re-read /proc and /sys right now"),
         ("?", "close this help"),
     ];
+    const INNER_WIDTH: u16 = 58;
 
-    let inner_width = 58usize;
-    let width = (inner_width as u16 + 2).min(buffer.width().saturating_sub(4));
-    let height = (entries.len() as u16 + 4).min(buffer.height().saturating_sub(2));
+    let entries = u16::try_from(ENTRIES.len()).unwrap_or(u16::MAX);
+    let width = (INNER_WIDTH + 2).min(buffer.width().saturating_sub(4));
+    let height = (entries + 4).min(buffer.height().saturating_sub(2));
+    if width < 4 || height < 4 {
+        return;
+    }
     let x = (buffer.width() - width) / 2;
     let y = (buffer.height() - height) / 2;
+    let (right, bottom) = (x + width - 1, y + height - 1);
 
     let panel = Style::new(palette.foreground).on(palette.background);
-    for row in y..y + height {
-        for col in x..x + width {
-            buffer.put(col, row, " ", panel);
-        }
+    for row in y..=bottom {
+        buffer.hline(x, row, right + 1, ' ', panel);
     }
 
     let border = Style::new(palette.accent);
     buffer.put(x, y, "┌", border);
-    buffer.put(x + width - 1, y, "┐", border);
-    buffer.put(x, y + height - 1, "└", border);
-    buffer.put(x + width - 1, y + height - 1, "┘", border);
-    buffer.hline(x + 1, y, x + width - 1, '─', border);
-    buffer.hline(x + 1, y + height - 1, x + width - 1, '─', border);
-    buffer.vline(x, y + 1, y + height - 1, '│', border);
-    buffer.vline(x + width - 1, y + 1, y + height - 1, '│', border);
+    buffer.put(right, y, "┐", border);
+    buffer.put(x, bottom, "└", border);
+    buffer.put(right, bottom, "┘", border);
+    buffer.hline(x + 1, y, right, '─', border);
+    buffer.hline(x + 1, bottom, right, '─', border);
+    buffer.vline(x, y + 1, bottom, '│', border);
+    buffer.vline(right, y + 1, bottom, '│', border);
     buffer.put(x + 2, y, " keys ", Style::new(palette.accent).bold());
 
-    for (index, (k, d)) in entries.iter().enumerate() {
-        let row = y + 2 + index as u16;
-        if row >= y + height - 1 {
-            break;
-        }
+    for (row, (k, d)) in (y + 2..bottom).zip(ENTRIES) {
         buffer.put(x + 2, row, k, Style::new(palette.accent));
         buffer.put(x + 17, row, d, panel);
     }
 
     buffer.put(
         x + 2,
-        y + height - 2,
+        bottom - 1,
         "press ? or esc to close",
         Style::new(palette.muted).on(palette.background),
     );
-    let _ = app;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::app::{App, Filter};
-    use crate::collect::{Bar, Row, Section, Stats};
+    use crate::collect::{Section, Snapshot};
+    use crate::event::Trigger;
+    use crate::input::Key;
     use crate::term::Color;
-    use std::time::{Duration, Instant};
+    use crate::text::Text;
 
     /// Drop ANSI escapes so a rendered buffer can be compared as text.
     fn strip_ansi(s: &str) -> String {
@@ -455,46 +493,54 @@ mod tests {
         Palette::default()
     }
 
-    /// A hand-built App so the tests do not depend on this machine's hardware.
-    fn app_with(section_rows: Vec<Row>) -> App {
-        App {
-            sections: vec![Section::new("Test", section_rows)],
-            selected: 0,
-            focus: Focus::Sections,
-            scroll: 0,
-            should_quit: false,
-            show_help: false,
-            status: String::new(),
-            status_at: Instant::now(),
-            filter: Filter::default(),
-            last_refresh: Instant::now(),
-            refresh_interval: Duration::from_secs(3600),
-            stats: Stats::new(),
-            hostname: "testhost".into(),
-            kernel: "6.1.0-test".into(),
+    fn snapshot(sections: Vec<Section>) -> Snapshot {
+        Snapshot {
+            sections,
+            hostname: Text::new("testhost"),
+            kernel: Text::new("6.1.0-test"),
+            uptime: 3_661,
         }
     }
 
-    fn sample_rows() -> Vec<Row> {
-        vec![
-            Row::Header("Group".into()),
-            Row::field("Label", "value"),
-            Row::Field {
-                label: "Barred".into(),
-                value: "42%".into(),
-                bar: Some(Bar::new(0.42)),
-            },
-            Row::note("a note"),
-            Row::Blank,
-            Row::field("Second", "value"),
-        ]
+    /// A hand-built App so the tests do not depend on this machine's hardware.
+    fn app_with(sections: Vec<Section>, height: u16) -> App {
+        let mut app = App::new();
+        app.on_snapshot(snapshot(sections), Trigger::Timer);
+        app.set_viewport(detail_rows(height));
+        app
+    }
+
+    fn sample() -> Vec<Section> {
+        vec![Section::new(
+            "Test",
+            vec![
+                Row::header("Group"),
+                Row::field("Label", "value"),
+                Row::field_with("Barred", "42%", 0.42),
+                Row::note("a note"),
+                Row::Blank,
+                Row::field("Second", "value"),
+            ],
+        )]
     }
 
     fn buffer(w: u16, h: u16) -> Buffer {
         Buffer::new(w, h, Style::new(Color::Default))
     }
 
-    // ---- sidebar_width ---------------------------------------------------
+    fn drawn(app: &App, w: u16, h: u16) -> Buffer {
+        let mut b = buffer(w, h);
+        draw(&mut b, app, &palette());
+        b
+    }
+
+    fn press(app: &mut App, keys: &[Key]) {
+        for key in keys {
+            app.on_key(*key);
+        }
+    }
+
+    // ---- layout helpers --------------------------------------------------
 
     #[test]
     fn sidebar_width_is_clamped_at_both_ends() {
@@ -507,34 +553,10 @@ mod tests {
         assert_eq!(sidebar_width(0), 12, "never collapses to zero");
     }
 
-    // ---- clip ------------------------------------------------------------
-
     #[test]
-    fn clip_leaves_text_that_already_fits() {
-        assert_eq!(clip("abc", 3), "abc");
-        assert_eq!(clip("abc", 10), "abc");
-        assert_eq!(clip("", 5), "");
-        assert_eq!(clip("", 0), "");
-    }
-
-    #[test]
-    fn clip_truncates_with_an_ellipsis_that_fits_inside_the_budget() {
-        assert_eq!(clip("abcdef", 4), "abc…");
-        assert_eq!(clip("abcdef", 1), "…");
-        assert_eq!(clip("abcdef", 2), "a…");
-    }
-
-    #[test]
-    fn clip_of_zero_width_produces_nothing() {
-        // The old saturating_sub made a zero-width clip emit a lone ellipsis,
-        // which then overwrote a neighbouring column.
-        assert_eq!(clip("abcdef", 0), "");
-    }
-
-    #[test]
-    fn clip_counts_chars_not_bytes() {
-        assert_eq!(clip("ééééé", 3), "éé…");
-        assert_eq!(clip("→→→", 3), "→→→");
+    fn detail_rows_leaves_room_for_the_chrome() {
+        assert_eq!(detail_rows(24), 21);
+        assert_eq!(detail_rows(2), 0);
     }
 
     // ---- strip_percent / is_percent ---------------------------------------
@@ -579,7 +601,6 @@ mod tests {
 
     #[test]
     fn draw_reports_a_too_small_terminal_instead_of_mangling_the_screen() {
-        let p = palette();
         for (w, h) in [
             (0, 0),
             (1, 1),
@@ -587,20 +608,14 @@ mod tests {
             (19, 20),
             (20, 5),
             (19, 5),
-            (40, 6),
-            (60, 6),
+            (46, 5),
+            (60, 3),
         ] {
-            let mut b = buffer(w, h);
-            let app = app_with(sample_rows());
-            draw(&mut b, &app, &p);
-            if w >= 20 && h >= 6 {
-                continue;
-            }
-            // Below 20x6 the layout gives up and asks for a resize. The hint
-            // itself needs 46 columns and 2 rows, so a smaller buffer than that
-            // can only be checked for not panicking.
-            let text = rows(&b).concat();
+            let b = drawn(&app_with(sample(), h), w, h);
+            // The hint itself needs 46 columns and 2 rows, so a smaller buffer
+            // than that can only be checked for not panicking.
             if w >= 46 && h >= 2 {
+                let text = rows(&b).concat();
                 assert!(
                     text.contains("terminal too small"),
                     "expected a resize hint at {w}x{h}, got {text:?}"
@@ -610,90 +625,86 @@ mod tests {
     }
 
     #[test]
-    fn draw_survives_every_size_without_panicking() {
-        // The layout is full of saturating_sub and `width - 1` arithmetic; a
-        // sweep is the cheapest way to catch an underflow at a size nobody
-        // thought to check.
-        let p = palette();
-        let app = app_with(sample_rows());
-        for w in 0u16..48 {
-            for h in 0u16..16 {
-                let mut b = buffer(w, h);
-                draw(&mut b, &app, &p);
+    fn draw_survives_every_size_in_every_mode() {
+        // The layout is full of offset arithmetic; a sweep is the cheapest
+        // way to catch an underflow at a size nobody thought to check.
+        let modes: [&[Key]; 4] = [
+            &[],
+            &[Key::Char('?')],
+            &[Key::Char('/'), Key::Char('l'), Key::Char('a')],
+            &[Key::Right, Key::PageDown, Key::PageDown],
+        ];
+        for keys in modes {
+            for w in 0u16..48 {
+                for h in 0u16..16 {
+                    let mut app = app_with(sample(), h);
+                    press(&mut app, keys);
+                    drawn(&app, w, h);
+                }
             }
         }
     }
 
     #[test]
-    fn draw_survives_every_size_with_the_help_overlay_open() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        app.show_help = true;
-        for w in 0u16..48 {
-            for h in 0u16..16 {
-                let mut b = buffer(w, h);
-                draw(&mut b, &app, &p);
-            }
-        }
-    }
+    fn draw_before_the_first_snapshot_says_it_is_collecting() {
+        let text = rows(&drawn(&App::new(), 80, 24)).concat();
 
-    #[test]
-    fn draw_survives_every_size_with_a_filter_and_scrolled_pane() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        app.filter.active = true;
-        app.filter.query = "la".into();
-        app.scroll = 5;
-        for w in 0u16..48 {
-            for h in 0u16..16 {
-                let mut b = buffer(w, h);
-                draw(&mut b, &app, &p);
-            }
-        }
+        assert!(text.contains("collecting"), "{text}");
+        assert!(text.contains("waiting for the first reading"), "{text}");
     }
 
     // ---- draw: content ---------------------------------------------------
 
     #[test]
-    fn draw_shows_the_hostname_kernel_and_section_titles() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        app.sections
-            .push(Section::new("Second Section", vec![Row::field("a", "b")]));
-        let mut b = buffer(80, 24);
-        draw(&mut b, &app, &p);
+    fn draw_shows_the_hostname_kernel_uptime_and_section_titles() {
+        let mut sections = sample();
+        sections.push(Section::new("Second Section", vec![Row::field("a", "b")]));
+        let text = rows(&drawn(&app_with(sections, 24), 80, 24)).concat();
 
-        let text = rows(&b).concat();
         assert!(text.contains("omarchy-sysinfo"), "header title missing");
         assert!(text.contains("testhost"), "hostname missing");
         assert!(text.contains("6.1.0-test"), "kernel missing");
+        assert!(text.contains("1h 1m 1s"), "uptime missing");
         assert!(text.contains("Test"), "section title missing");
         assert!(text.contains("Second Section"), "second section missing");
     }
 
     #[test]
-    fn draw_marks_the_selected_section() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        app.sections.push(Section::new("Other", vec![]));
-        app.select(1);
-        let mut b = buffer(80, 24);
-        draw(&mut b, &app, &p);
-        let text = rows(&b).concat();
-        assert!(text.contains('▸'), "the selected row needs a marker");
-        // Exactly one section is selected at a time.
+    fn draw_marks_exactly_the_selected_section() {
+        let mut sections = sample();
+        sections.push(Section::new("Other", vec![]));
+        let mut app = app_with(sections, 24);
+        app.on_key(Key::Down);
+        let text = rows(&drawn(&app, 80, 24)).concat();
+
+        assert!(text.contains("▸ Other"), "{text}");
         assert_eq!(text.matches('▸').count(), 1);
     }
 
     #[test]
-    fn draw_renders_a_gauge_for_rows_that_carry_one() {
-        let p = palette();
-        let app = app_with(sample_rows());
-        let mut b = buffer(80, 24);
-        draw(&mut b, &app, &p);
-        let text = rows(&b).concat();
+    fn a_sidebar_that_does_not_fit_says_how_many_sections_are_hidden() {
+        let sections: Vec<Section> = (0..14)
+            .map(|i| Section::new(format!("Section {i}"), vec![]))
+            .collect();
+        let b = drawn(&app_with(sections, 10), 60, 10);
+
+        // Ten rows: header, title rule, six sections, the hint, the footer.
+        assert!(row(&b, 8).contains("+8 more"), "{:?}", rows(&b));
+        assert!(row(&b, 7).contains("Section 5"), "{:?}", rows(&b));
+    }
+
+    #[test]
+    fn a_sidebar_that_fits_has_no_hint() {
+        let text = rows(&drawn(&app_with(sample(), 24), 80, 24)).concat();
+
+        assert!(!text.contains("more"), "{text}");
+    }
+
+    #[test]
+    fn draw_renders_a_gauge_and_prints_its_percentage_once() {
+        let text = rows(&drawn(&app_with(sample(), 24), 80, 24)).concat();
+
         assert!(text.contains('█') || text.contains('░'), "no gauge drawn");
-        assert!(text.contains("42%"), "the percentage should be shown once");
         assert_eq!(
             text.matches("42%").count(),
             1,
@@ -702,71 +713,90 @@ mod tests {
     }
 
     #[test]
-    fn draw_never_scrolls_past_the_end_of_the_content() {
-        // Regression: max_scroll is row-count based, so a short section on a
-        // tall pane used to scroll into empty space.
-        let p = palette();
-        let mut app = app_with(vec![Row::field("only", "row")]);
-        app.scroll = 40;
-        let mut b = buffer(80, 40);
-        draw(&mut b, &app, &p);
-        let text = rows(&b).concat();
-        assert!(text.contains("only"), "content must still be visible");
+    fn a_wide_value_does_not_push_the_frame_out_of_shape() {
+        // A CJK window title used to be measured in chars, overrun the right
+        // edge, and make the terminal wrap the row.
+        let sections = vec![Section::new(
+            "Wide",
+            vec![Row::field(
+                "Focused window",
+                "日本語のウィンドウタイトル".repeat(4),
+            )],
+        )];
+        let b = drawn(&app_with(sections, 24), 60, 24);
+
+        for line in rows(&b) {
+            assert!(
+                text_width(&line) <= 60,
+                "{line:?} is {} cells",
+                text_width(&line)
+            );
+        }
+    }
+
+    #[test]
+    fn the_last_rows_stay_on_screen_at_maximum_scroll() {
+        let many: Vec<Row> = (0..40)
+            .map(|i| Row::field(format!("row {i}"), "v"))
+            .collect();
+        let mut app = app_with(vec![Section::new("Long", many)], 24);
+        press(
+            &mut app,
+            &[Key::Right, Key::PageDown, Key::PageDown, Key::PageDown],
+        );
+        let b = drawn(&app, 80, 24);
+
+        assert!(row(&b, 22).contains("row 39"), "{:?}", rows(&b));
+        assert!(row(&b, 1).contains("20-40 of 40"), "{:?}", row(&b, 1));
     }
 
     #[test]
     fn draw_says_so_when_a_filter_matches_nothing() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        app.filter.query = "zzzzz".into();
-        let mut b = buffer(80, 24);
-        draw(&mut b, &app, &p);
-        assert!(rows(&b).concat().contains("no rows match"));
+        let mut app = app_with(sample(), 24);
+        press(&mut app, &[Key::Char('/'), Key::Char('z'), Key::Char('z')]);
+
+        assert!(
+            rows(&drawn(&app, 80, 24))
+                .concat()
+                .contains("no rows match")
+        );
     }
 
     #[test]
     fn draw_shows_the_row_range_in_the_detail_title() {
-        let p = palette();
-        let app = app_with(sample_rows());
-        let mut b = buffer(80, 24);
-        draw(&mut b, &app, &p);
-        // Row 0 is the header; the detail pane's own title sits on row 1.
-        assert!(rows(&b)[0].contains("omarchy-sysinfo"), "header missing");
-        assert!(
-            rows(&b)[1].contains("1-"),
-            "range indicator missing: {:?}",
-            rows(&b)[1]
-        );
+        let b = drawn(&app_with(sample(), 24), 80, 24);
+
+        assert!(row(&b, 0).contains("omarchy-sysinfo"), "header missing");
+        assert!(row(&b, 1).contains("1-6 of 6"), "{:?}", row(&b, 1));
     }
 
     // ---- footer ----------------------------------------------------------
 
     #[test]
     fn footer_shows_the_filter_prompt_while_filtering() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        app.filter.active = true;
-        app.filter.query = "gpu".into();
-        let mut b = buffer(80, 24);
-        draw(&mut b, &app, &p);
-        let last = row(&b, 23);
+        let mut app = app_with(sample(), 24);
+        press(
+            &mut app,
+            &[
+                Key::Char('/'),
+                Key::Char('g'),
+                Key::Char('p'),
+                Key::Char('u'),
+            ],
+        );
+        let last = row(&drawn(&app, 80, 24), 23);
+
         assert!(last.contains("gpu"), "typed query not echoed: {last:?}");
         assert!(last.contains("esc to clear"), "filter hint missing");
     }
 
     #[test]
     fn footer_hints_mean_different_things_per_focus() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        let mut b = buffer(80, 24);
+        let mut app = app_with(sample(), 24);
+        assert!(row(&drawn(&app, 80, 24), 23).contains("section"));
 
-        app.focus = Focus::Sections;
-        draw(&mut b, &app, &p);
-        assert!(row(&b, 23).contains("section"));
-
-        app.focus = Focus::Detail;
-        draw(&mut b, &app, &p);
-        let focused = row(&b, 23);
+        app.on_key(Key::Tab);
+        let focused = row(&drawn(&app, 80, 24), 23);
         assert!(
             focused.contains("scroll"),
             "expected a scroll hint: {focused:?}"
@@ -775,25 +805,18 @@ mod tests {
 
     #[test]
     fn footer_shows_a_status_message() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        app.set_status("refreshed");
-        let mut b = buffer(80, 24);
-        draw(&mut b, &app, &p);
-        assert!(row(&b, 23).contains("refreshed"));
+        let mut app = app_with(sample(), 24);
+        app.on_key(Key::Char('r'));
+
+        assert!(row(&drawn(&app, 80, 24), 23).contains("refreshing"));
     }
 
     #[test]
-    fn footer_drops_hints_that_would_not_fit() {
-        let p = palette();
-        let app = app_with(sample_rows());
+    fn footer_keeps_the_quit_hint_at_every_width() {
+        let app = app_with(sample(), 10);
         for w in 20u16..40 {
-            let mut b = buffer(w, 10);
-            draw(&mut b, &app, &p);
-            // Nothing may be written past the edge, which put() already
-            // guarantees; assert the first hint is present and the last is not.
-            let last = row(&b, 9);
-            assert!(last.contains("q"), "quit hint should survive at width {w}");
+            let last = row(&drawn(&app, w, 10), 9);
+            assert!(last.contains('q'), "quit hint should survive at width {w}");
         }
     }
 
@@ -801,12 +824,10 @@ mod tests {
 
     #[test]
     fn help_overlay_lists_the_bindings() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        app.show_help = true;
-        let mut b = buffer(100, 30);
-        draw(&mut b, &app, &p);
-        let text = rows(&b).concat();
+        let mut app = app_with(sample(), 30);
+        app.on_key(Key::Char('?'));
+        let text = rows(&drawn(&app, 100, 30)).concat();
+
         for expected in ["quit", "previous or next section", "filter", "help"] {
             assert!(text.contains(expected), "help is missing {expected:?}");
         }
@@ -814,13 +835,15 @@ mod tests {
 
     #[test]
     fn help_overlay_fits_itself_to_a_small_terminal() {
-        let p = palette();
-        let mut app = app_with(sample_rows());
-        app.show_help = true;
         for (w, h) in [(20u16, 6u16), (24, 8), (40, 10), (60, 20), (200, 60)] {
-            let mut b = buffer(w, h);
-            draw(&mut b, &app, &p);
-            assert_eq!(rows(&b).len(), h as usize, "row count changed at {w}x{h}");
+            let mut app = app_with(sample(), h);
+            app.on_key(Key::Char('?'));
+            let b = drawn(&app, w, h);
+            assert_eq!(
+                rows(&b).len(),
+                usize::from(h),
+                "row count changed at {w}x{h}"
+            );
         }
     }
 }

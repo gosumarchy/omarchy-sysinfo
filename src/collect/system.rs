@@ -1,38 +1,38 @@
-use super::stats::Stats;
-use super::{
-    fs::read,
-    units::{dash, human_secs},
-    Row,
-};
-use std::sync::OnceLock;
+//! The operating system: distribution, kernel, boot, and what it runs on.
+
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn rows(stats: &mut Stats) -> Vec<Row> {
-    let os_release = read("/etc/os-release").unwrap_or_default();
-    let name = os_release_field(&os_release, "PRETTY_NAME")
-        .or_else(|| os_release_field(&os_release, "NAME"))
-        .unwrap_or_else(|| "Linux".to_string());
-    let build = os_release_field(&os_release, "BUILD_ID").unwrap_or_else(|| "-".into());
-    let kernel = kernel();
-    let kernel_full = dash(read("/proc/version"));
+use super::stats::Stats;
+use super::units::{dash, human_secs, utc_timestamp};
+use super::{Host, Row};
 
-    let uptime = stats.uptime();
+pub(crate) fn rows(host: &Host, stats: &Stats) -> Vec<Row> {
+    let os_release = host.read("/etc/os-release").unwrap_or_default();
 
-    let mut rows = vec![Row::Header("System".into())];
-    rows.push(Row::field("Hostname", hostname()));
-    rows.push(Row::field("Distribution", name));
-    rows.push(Row::field("Build", build));
-    rows.push(Row::field("Kernel", kernel));
-    rows.push(Row::field("Kernel build", kernel_full));
-    rows.push(Row::field("Architecture", arch()));
-    rows.push(Row::field("Uptime", human_secs(uptime)));
-    let boot = boot_epoch();
+    let mut rows = vec![Row::header("System")];
+    // Hostnames are often a person's name (`georgios-thinkpad`).
+    rows.push(Row::identifier("Hostname", hostname(host)));
+    rows.push(Row::field("Distribution", distro_from(&os_release)));
+    rows.push(Row::field(
+        "Build",
+        os_release_field(&os_release, "BUILD_ID").unwrap_or_else(|| "-".into()),
+    ));
+    rows.push(Row::field("Kernel", kernel(host)));
+    rows.push(Row::field("Kernel build", dash(host.read("/proc/version"))));
+    rows.push(Row::field("Architecture", std::env::consts::ARCH));
+    rows.push(Row::field("Uptime", human_secs(stats.uptime())));
+    let boot = boot_epoch(host);
     if boot > 0 {
-        rows.push(Row::field("Booted", format_boot_time(boot)));
+        rows.push(Row::field("Booted", format_boot_time(boot, now_epoch())));
     }
 
-    rows.push(Row::Header("Boot".into()));
-    rows.push(Row::field("Command line", dash(super::fs::cmdline())));
+    rows.push(Row::header("Boot"));
+    // The command line names the root and resume devices, usually by UUID
+    // (`cryptdevice=PARTUUID=...`, `resume=UUID=...`).
+    rows.push(Row::with_embedded_identifiers(
+        "Command line",
+        dash(host.cmdline()),
+    ));
     for key in [
         "quiet",
         "splash",
@@ -42,68 +42,39 @@ pub fn rows(stats: &mut Stats) -> Vec<Row> {
         "mitigations",
         "nowatchdog",
     ] {
-        if let Some(value) = super::fs::kernel_param(key) {
-            rows.push(Row::field(format!("  {key}"), value));
+        if let Some(value) = host.kernel_param(key) {
+            rows.push(Row::with_embedded_identifiers(format!("  {key}"), value));
         }
     }
     rows.push(Row::field(
         "Init system",
-        if std::path::Path::new("/run/systemd/system").exists() {
+        if host.exists("/run/systemd/system") {
             "systemd"
         } else {
             "other"
         },
     ));
-    rows.push(Row::field(
-        "Command",
-        dash(
-            std::env::var("OMARCHY_SESSION")
-                .ok()
-                .or_else(|| read("/proc/self/comm")),
-        ),
-    ));
 
-    rows.push(Row::Header("Load".into()));
-    if let Some(load) = read("/proc/loadavg") {
-        rows.extend(parse_loadavg(&load));
-    }
-    if let Some(idle) = stats.idle_since_boot() {
-        rows.push(Row::field("CPU idle", format!("{idle:.0}% idle")));
-    }
+    // The load average lives in the CPU section, next to the per-core gauges;
+    // repeating it here printed the same three numbers twice in the report.
 
-    rows.push(Row::Header("Platform".into()));
-    let sys_vendor = read("/sys/class/dmi/id/sys_vendor").unwrap_or_default();
-    let product_name = read("/sys/class/dmi/id/product_name").unwrap_or_default();
+    rows.push(Row::header("Platform"));
+    let sys_vendor = host
+        .read("/sys/class/dmi/id/sys_vendor")
+        .unwrap_or_default();
+    let product_name = host
+        .read("/sys/class/dmi/id/product_name")
+        .unwrap_or_default();
     rows.push(Row::field(
         "Virtualization",
-        dash(detect_virtualization(&sys_vendor, &product_name).map(str::to_string)),
+        detect_virtualization(&sys_vendor, &product_name).unwrap_or("-"),
     ));
-    rows.push(Row::field("Container", container()));
+    rows.push(Row::field("Container", container(host)));
     // Secure Boot and Kernel lockdown belong to the firmware group in
     // `dmi::rows`; repeating them here printed both twice in the report.
-    rows.push(Row::field("Timezone", timezone()));
+    rows.push(Row::field("Timezone", timezone(host)));
     rows.push(Row::field("Locale", dash(std::env::var("LANG").ok())));
 
-    rows
-}
-
-/// The three load averages and the runnable/total task split from
-/// `/proc/loadavg`, which is `1 2 3 4/5 12345`.
-fn parse_loadavg(load: &str) -> Vec<Row> {
-    let parts: Vec<&str> = load.split_whitespace().collect();
-    let mut rows = Vec::new();
-    if parts.len() >= 3 {
-        rows.push(Row::field(
-            "1 / 5 / 15 min",
-            format!("{} / {} / {}", parts[0], parts[1], parts[2]),
-        ));
-    }
-    if let Some((runnable, total)) = parts.get(3).and_then(|v| v.split_once('/')) {
-        rows.push(Row::field(
-            "Runnable / total tasks",
-            format!("{runnable} / {total}"),
-        ));
-    }
     rows
 }
 
@@ -126,6 +97,7 @@ fn detect_virtualization(sys_vendor: &str, product_name: &str) -> Option<&'stati
     ]
     .iter()
     .any(|n| product.contains(n));
+
     match vendor.as_str() {
         "qemu" => Some("qemu"),
         "vmware" | "innotek gmbh" | "vmware, inc." => Some("vmware"),
@@ -140,23 +112,23 @@ fn detect_virtualization(sys_vendor: &str, product_name: &str) -> Option<&'stati
         "google" | "google compute engine" => Some("gcp"),
         "alibaba cloud" => Some("alibaba"),
         "nutanix" | "openstack foundation" => Some("openstack"),
+        // Every other vendor string is real hardware.
         _ => None,
     }
 }
 
-fn container() -> &'static str {
-    if std::path::Path::new("/.dockerenv").exists() {
-        "docker"
-    } else if read("/run/systemd/container").is_some() {
-        "systemd-nspawn"
-    } else if read("/proc/1/cgroup")
-        .map(|c| {
-            c.contains("docker")
-                || c.contains("lxc")
-                || c.contains("libpod")
-                || c.contains("kubepods")
-        })
-        .unwrap_or(false)
+fn container(host: &Host) -> &'static str {
+    if host.exists("/.dockerenv") {
+        return "docker";
+    }
+    if host.read("/run/systemd/container").is_some() {
+        return "systemd-nspawn";
+    }
+
+    let cgroup = host.read("/proc/1/cgroup").unwrap_or_default();
+    if ["docker", "lxc", "libpod", "kubepods"]
+        .iter()
+        .any(|marker| cgroup.contains(marker))
     {
         "cgroup-based"
     } else {
@@ -165,55 +137,60 @@ fn container() -> &'static str {
 }
 
 /// Host name, or a placeholder inside an unusual session.
-pub fn hostname() -> String {
-    dash(read("/proc/sys/kernel/hostname"))
+pub(crate) fn hostname(host: &Host) -> String {
+    dash(host.read("/proc/sys/kernel/hostname"))
 }
 
-pub fn distro() -> String {
-    let os_release = read("/etc/os-release").unwrap_or_default();
-    os_release_field(&os_release, "PRETTY_NAME")
-        .or_else(|| os_release_field(&os_release, "NAME"))
+pub(crate) fn distro(host: &Host) -> String {
+    distro_from(&host.read("/etc/os-release").unwrap_or_default())
+}
+
+fn distro_from(os_release: &str) -> String {
+    os_release_field(os_release, "PRETTY_NAME")
+        .or_else(|| os_release_field(os_release, "NAME"))
         .unwrap_or_else(|| "Linux".into())
 }
 
-pub fn kernel() -> String {
-    dash(read("/proc/sys/kernel/osrelease"))
+pub(crate) fn kernel(host: &Host) -> String {
+    dash(host.read("/proc/sys/kernel/osrelease"))
 }
 
-pub fn arch() -> String {
-    std::env::consts::ARCH.to_string()
-}
-
-pub fn timezone() -> String {
-    read("/etc/timezone")
+pub(crate) fn timezone(host: &Host) -> String {
+    host.read("/etc/timezone")
         .or_else(|| {
-            std::fs::read_link("/etc/localtime")
-                .ok()
-                .map(|t| t.to_string_lossy().to_string())
-                .map(|t| match t.rfind("zoneinfo/") {
-                    // The symlink may be relative, e.g. ../usr/share/zoneinfo/...
-                    Some(at) => t[at + "zoneinfo/".len()..].to_string(),
-                    None => t,
-                })
+            let target = std::fs::read_link(host.path("/etc/localtime")).ok()?;
+
+            Some(zone_from_link(&target.to_string_lossy()))
         })
         .unwrap_or_else(|| "unknown".into())
 }
 
-/// Seconds since the epoch the kernel recorded for this boot.
-///
-/// `btime` does not move, so the `/proc/stat` read happens once.
-pub fn boot_epoch() -> u64 {
-    static CACHED: OnceLock<u64> = OnceLock::new();
-    *CACHED.get_or_init(|| {
-        read("/proc/stat")
-            .and_then(|s| {
-                s.lines()
-                    .find(|l| l.starts_with("btime"))
-                    .and_then(|l| l.split_whitespace().nth(1))
-                    .and_then(|v| v.parse().ok())
-            })
-            .unwrap_or(0)
-    })
+/// `/etc/localtime` points into the zoneinfo tree, possibly relatively
+/// (`../usr/share/zoneinfo/Europe/Oslo`); the zone is what follows it.
+fn zone_from_link(target: &str) -> String {
+    const MARKER: &str = "zoneinfo/";
+
+    match target.rfind(MARKER) {
+        Some(at) => target[at + MARKER.len()..].to_string(),
+        None => target.to_string(),
+    }
+}
+
+/// Seconds since the epoch the kernel recorded for this boot, or 0.
+pub(crate) fn boot_epoch(host: &Host) -> u64 {
+    host.read("/proc/stat")
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("btime "))
+                .and_then(|v| v.trim().parse().ok())
+        })
+        .unwrap_or(0)
+}
+
+fn now_epoch() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// One value out of an os-release style file.
@@ -227,26 +204,32 @@ fn os_release_field(content: &str, key: &str) -> Option<String> {
         .lines()
         .find_map(|l| l.strip_prefix(&prefix))
         .map(str::trim)
-        .map(|v| match v.chars().next() {
-            Some('"') if v.ends_with('"') && v.len() > 1 => &v[1..v.len() - 1],
-            Some('\'') if v.ends_with('\'') && v.len() > 1 => &v[1..v.len() - 1],
-            _ => v,
+        .map(|v| {
+            let quoted = v.len() > 1
+                && ((v.starts_with('"') && v.ends_with('"'))
+                    || (v.starts_with('\'') && v.ends_with('\'')));
+            if quoted { &v[1..v.len() - 1] } else { v }
         })
         .map(str::to_string);
+
     value.filter(|v| !v.is_empty())
 }
 
-fn format_boot_time(epoch: u64) -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(epoch);
-    format!("{} ({} ago)", epoch, human_secs(secs.saturating_sub(epoch)))
+/// `2026-09-28 14:05 UTC (3h 2m 1s ago)`.
+///
+/// A clock set before the boot time reads as zero ago rather than wrapping.
+fn format_boot_time(epoch: u64, now: u64) -> String {
+    format!(
+        "{} ({} ago)",
+        utc_timestamp(epoch),
+        human_secs(now.saturating_sub(epoch))
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::fixture::Fixture;
 
     // ---- os_release_field -----------------------------------------------
 
@@ -313,43 +296,10 @@ EMPTY=
     }
 
     #[test]
-    fn distro_and_build_survive_a_missing_os_release() {
-        // Nothing on this machine can be wrong enough to panic.
-        assert!(!distro().is_empty());
-        assert!(!kernel().is_empty());
-        assert!(!arch().is_empty());
-    }
-
-    // ---- parse_loadavg ---------------------------------------------------
-
-    #[test]
-    fn parse_loadavg_reads_the_averages_and_the_task_split() {
-        let rows = parse_loadavg("0.52 0.58 0.59 2/1234 56789");
-        let text: Vec<String> = rows.iter().map(|r| format!("{r:?}")).collect();
-        assert!(
-            text.iter().any(|t| t.contains("0.52 / 0.58 / 0.59")),
-            "{text:?}"
-        );
-        assert!(text.iter().any(|t| t.contains("2 / 1234")), "{text:?}");
-    }
-
-    #[test]
-    fn parse_loadavg_keeps_the_averages_when_the_task_field_is_absent() {
-        let rows = parse_loadavg("0.10 0.20 0.30");
-        assert_eq!(rows.len(), 1);
-        assert!(format!("{:?}", rows[0]).contains("0.10 / 0.20 / 0.30"));
-    }
-
-    #[test]
-    fn parse_loadavg_ignores_a_malformed_task_field() {
-        let rows = parse_loadavg("0.10 0.20 0.30 notanumber");
-        assert_eq!(rows.len(), 1, "a missing slash must not invent a value");
-    }
-
-    #[test]
-    fn parse_loadavg_of_junk_is_empty() {
-        assert!(parse_loadavg("").is_empty());
-        assert!(parse_loadavg("garbage").is_empty());
+    fn distro_falls_back_to_name_then_linux() {
+        assert_eq!(distro_from(OS_RELEASE), "Arch Linux");
+        assert_eq!(distro_from("NAME=Omarchy\n"), "Omarchy");
+        assert_eq!(distro_from(""), "Linux");
     }
 
     // ---- detect_virtualization -------------------------------------------
@@ -419,51 +369,90 @@ EMPTY=
         assert_eq!(detect_virtualization("Bochs", ""), Some("bochs"));
     }
 
-    // ---- live values -----------------------------------------------------
+    // ---- against a fixture -------------------------------------------------
 
     #[test]
-    fn live_values_are_all_populated() {
-        assert!(!hostname().is_empty());
-        assert!(!container().is_empty());
-        assert!(!timezone().is_empty());
+    fn host_values_come_from_the_host() {
+        let fx = Fixture::new();
+        fx.write("proc/sys/kernel/hostname", "omarchy-box\n");
+        fx.write("proc/sys/kernel/osrelease", "6.16.8-arch1-1\n");
+        fx.symlink("etc/localtime", "../usr/share/zoneinfo/Europe/Oslo");
+        let host = fx.host();
+
+        assert_eq!(hostname(&host), "omarchy-box");
+        assert_eq!(kernel(&host), "6.16.8-arch1-1");
+        assert_eq!(timezone(&host), "Europe/Oslo");
+        assert_eq!(container(&host), "none");
     }
 
     #[test]
-    fn timezone_never_leaks_a_path_prefix_or_a_newline() {
-        let tz = timezone();
-        assert!(!tz.contains('\n'), "{tz:?}");
-        assert!(!tz.contains("zoneinfo"), "{tz:?}");
-        assert!(!tz.starts_with('/'), "{tz:?}");
+    fn missing_values_have_placeholders() {
+        let fx = Fixture::new();
+        let host = fx.host();
+
+        assert_eq!(hostname(&host), "-");
+        assert_eq!(timezone(&host), "unknown");
+        assert_eq!(boot_epoch(&host), 0);
     }
 
     #[test]
-    fn boot_epoch_is_either_zero_or_a_plausible_date() {
-        let boot = boot_epoch();
-        if boot > 0 {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .expect("clock is sane")
-                .as_secs();
-            assert!(boot <= now, "boot time is in the future: {boot} > {now}");
-            // Not before 2000, which would mean we parsed the wrong column.
-            assert!(boot > 946_684_800, "implausible boot time {boot}");
-        }
+    fn zone_from_link_strips_the_zoneinfo_prefix() {
+        assert_eq!(zone_from_link("/usr/share/zoneinfo/UTC"), "UTC");
+        assert_eq!(
+            zone_from_link("../usr/share/zoneinfo/America/New_York"),
+            "America/New_York"
+        );
+        assert_eq!(zone_from_link("/etc/custom"), "/etc/custom");
     }
 
     #[test]
-    fn format_boot_time_tolerates_a_clock_set_backwards() {
+    fn boot_epoch_reads_btime_and_nothing_that_merely_starts_with_it() {
+        let fx = Fixture::new();
+        fx.write("proc/stat", "cpu 1 1 1 1\nbtimex 5\nbtime 1700000000\n");
+
+        assert_eq!(boot_epoch(&fx.host()), 1_700_000_000);
+    }
+
+    #[test]
+    fn a_container_is_recognised_by_its_cgroup() {
+        let fx = Fixture::new();
+        fx.write("proc/1/cgroup", "0::/kubepods/besteffort/pod1\n");
+
+        assert_eq!(container(&fx.host()), "cgroup-based");
+    }
+
+    #[test]
+    fn boot_time_is_a_date_and_an_age() {
+        assert_eq!(
+            format_boot_time(1_790_604_300, 1_790_604_300 + 3_661),
+            "2026-09-28 14:05 UTC (1h 1m 1s ago)"
+        );
+    }
+
+    #[test]
+    fn boot_time_tolerates_a_clock_set_backwards() {
         // A boot time in the future must not wrap into a huge uptime.
-        let s = format_boot_time(u64::MAX);
-        assert!(s.contains("0 seconds") || s.contains('('), "{s}");
+        assert!(format_boot_time(2_000, 1_000).ends_with("(0m 0s ago)"));
     }
 
     #[test]
-    fn rows_render_without_panicking_or_producing_nan() {
-        let mut stats = Stats::new();
-        let rows = rows(&mut stats);
+    fn the_hostname_is_an_identifier() {
+        let fx = Fixture::new();
+        fx.write("proc/sys/kernel/hostname", "georgios-thinkpad\n");
+        let host = fx.host();
+
+        assert!(
+            rows(&host, &Stats::new(&host))
+                .contains(&Row::identifier("Hostname", "georgios-thinkpad"))
+        );
+    }
+
+    #[test]
+    fn rows_render_without_panicking_on_an_empty_machine() {
+        let fx = Fixture::new();
+        let host = fx.host();
+        let rows = rows(&host, &Stats::new(&host));
+
         assert!(rows.len() > 5);
-        let text: String = rows.iter().map(|r| format!("{r:?}")).collect();
-        assert!(!text.contains("NaN"), "{text}");
-        assert!(!text.contains("∞"), "{text}");
     }
 }

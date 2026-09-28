@@ -1,86 +1,127 @@
-use super::stats::Stats;
-use super::{
-    fs::{read, read_u64},
-    units::{human_mhz, human_secs},
-    Row,
-};
-use std::sync::OnceLock;
+//! The processor: what it is, how it is laid out, and how busy it is.
 
-/// `/proc/cpuinfo` does not change for the life of the process.
-fn cpuinfo() -> String {
-    static CACHED: OnceLock<String> = OnceLock::new();
-    CACHED
-        .get_or_init(|| read("/proc/cpuinfo").unwrap_or_default())
-        .clone()
+use std::collections::HashSet;
+
+use super::fs::{list_dir, read_u64};
+use super::stats::Stats;
+use super::units::{human_mhz, human_secs};
+use super::{Host, Row};
+
+/// What `/proc/cpuinfo` says about the chip. It does not change while the
+/// process runs, so it is parsed once rather than on every refresh.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CpuInfo {
+    brand: String,
+    vendor: Option<String>,
+    microcode: Option<String>,
+    flags: String,
 }
 
-/// The name of the socket, e.g. `Ulysses-S`.
-pub fn brand() -> String {
-    parse_brand(&cpuinfo())
+impl CpuInfo {
+    pub(crate) fn read(host: &Host) -> CpuInfo {
+        let cpuinfo = host.read("/proc/cpuinfo").unwrap_or_default();
+        // The sysfs file is the authoritative revision and follows a late
+        // microcode load; cpuinfo is the fallback for kernels without it.
+        let microcode = host
+            .read("/sys/devices/system/cpu/cpu0/microcode/version")
+            .or_else(|| line_value(&cpuinfo, "microcode"))
+            .map(|m| with_hex_prefix(&m));
+
+        CpuInfo {
+            brand: parse_brand(&cpuinfo),
+            vendor: line_value(&cpuinfo, "vendor_id"),
+            microcode,
+            flags: parse_flags(&cpuinfo),
+        }
+    }
+
+    /// The name of the socket, e.g. `12th Gen Intel(R) Core(TM) i7-1260P`.
+    pub(crate) fn brand(&self) -> &str {
+        &self.brand
+    }
+}
+
+/// Both sysfs and cpuinfo already print `0x...`; only add the prefix when a
+/// source did not, so the row never reads `0x0x...`.
+fn with_hex_prefix(value: &str) -> String {
+    if value.starts_with("0x") {
+        value.to_string()
+    } else {
+        format!("0x{value}")
+    }
 }
 
 /// `model name` on x86, but ARM boards say `Hardware`, `Processor` or `Model`.
 fn parse_brand(cpuinfo: &str) -> String {
-    for key in ["model name", "Model name", "Hardware", "Processor", "Model"] {
-        if let Some(value) = line_value(cpuinfo, key) {
-            if !value.is_empty() {
-                return value;
-            }
-        }
-    }
-    "unknown CPU".to_string()
+    ["model name", "Model name", "Hardware", "Processor", "Model"]
+        .into_iter()
+        .filter_map(|key| line_value(cpuinfo, key))
+        .find(|value| !value.is_empty())
+        .unwrap_or_else(|| "unknown CPU".to_string())
 }
 
-pub fn rows(stats: &mut Stats) -> Vec<Row> {
+pub(crate) fn rows(host: &Host, stats: &Stats, info: &CpuInfo) -> Vec<Row> {
     let mut rows = vec![
-        Row::field("Model", brand()),
-        Row::field(
-            "Vendor",
-            super::units::dash(line_value(&cpuinfo(), "vendor_id")),
-        ),
-        Row::field(
-            "Microcode",
-            super::units::dash(
-                read("/sys/devices/system/cpu/cpu0/cpufreq/microcode").map(|m| format!("0x{m}")),
-            ),
-        ),
+        Row::field("Model", info.brand.as_str()),
+        Row::field("Vendor", info.vendor.as_deref().unwrap_or("-")),
+        Row::field("Microcode", info.microcode.as_deref().unwrap_or("-")),
     ];
 
-    let logical = stats.per_core().len();
-    if logical == 0 {
-        rows.push(Row::note("no cpu topology exposed"));
+    let cores = stats.cores();
+    if cores.is_empty() {
+        rows.push(Row::note("no per-core counters in /proc/stat"));
 
         return rows;
     }
-    // Threads come in pairs unless the topology says otherwise; fall back to
-    // the online cpu list when we cannot tell.
-    let physical = physical_cores().unwrap_or(logical.div_ceil(2));
 
-    let max_mhz = read_u64("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_max_freq")
-        .map(|k| k / 1000)
-        .unwrap_or(0);
-    let min_mhz = read_u64("/sys/devices/system/cpu/cpu0/cpufreq/cpuinfo_min_freq")
-        .map(|k| k / 1000)
-        .unwrap_or(0);
-    let gov = read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor").unwrap_or_default();
+    rows.extend(topology_rows(host, cores.len(), info));
+    rows.extend(load_rows(host, stats));
 
-    rows.push(Row::Header("Topology".into()));
-    rows.push(Row::field(
-        "Cores / threads",
-        format!("{physical} / {logical}"),
-    ));
-    if !gov.is_empty() {
-        rows.push(Row::field("Frequency governor", gov));
+    let boot_epoch = super::system::boot_epoch(host);
+    if boot_epoch > 0 {
+        rows.push(Row::header("Time"));
+        rows.push(Row::field("Since boot", human_secs(stats.uptime())));
+        rows.push(Row::field(
+            "Booted at",
+            super::units::utc_timestamp(boot_epoch),
+        ));
     }
-    if max_mhz > 0 {
-        let range = if min_mhz > 0 {
-            format!("{} – {}", human_mhz(min_mhz), human_mhz(max_mhz))
-        } else {
-            human_mhz(max_mhz)
-        };
-        rows.push(Row::field("Frequency range", range));
+
+    rows
+}
+
+fn topology_rows(host: &Host, logical: usize, info: &CpuInfo) -> Vec<Row> {
+    let cpufreq = "/sys/devices/system/cpu/cpu0/cpufreq";
+    let mut rows = vec![Row::header("Topology")];
+
+    let cores = match physical_cores(host) {
+        Some(physical) => format!("{physical} / {logical}"),
+        None => format!("? / {logical} (no topology in sysfs)"),
+    };
+    rows.push(Row::field("Cores / threads", cores));
+
+    if let Some(governor) = host.read(format!("{cpufreq}/scaling_governor")) {
+        rows.push(Row::field("Frequency governor", governor));
     }
-    if let Some(online) = read("/sys/devices/system/cpu/online") {
+
+    let khz_to_mhz = |file: &str| {
+        host.read_u64(format!("{cpufreq}/{file}"))
+            .map(|k| k / 1000)
+            .filter(|mhz| *mhz > 0)
+    };
+    match (
+        khz_to_mhz("cpuinfo_min_freq"),
+        khz_to_mhz("cpuinfo_max_freq"),
+    ) {
+        (Some(min), Some(max)) => rows.push(Row::field(
+            "Frequency range",
+            format!("{} – {}", human_mhz(min), human_mhz(max)),
+        )),
+        (None, Some(max)) => rows.push(Row::field("Frequency range", human_mhz(max))),
+        (_, None) => {}
+    }
+
+    if let Some(online) = host.read("/sys/devices/system/cpu/online") {
         // The file is a CPU list (`0-15`, `0-3,8-11`), not a count. Parsing it
         // as a number meant the row never appeared.
         let value = match count_cpu_list(&online) {
@@ -89,100 +130,84 @@ pub fn rows(stats: &mut Stats) -> Vec<Row> {
         };
         rows.push(Row::field("Online CPUs", value));
     }
-    rows.push(Row::field("Flags", flag_summary()));
+    rows.push(Row::field("Flags", info.flags.as_str()));
 
-    // Live load: average first, then one line per logical CPU. One read is
-    // not a delta, so say so rather than print a confident zero.
-    let usages: Vec<f64> = stats.per_core().to_vec();
-    if usages.is_empty() {
-        rows.push(Row::note("no per-core counters in /proc/stat"));
+    rows
+}
+
+/// The load average, then one gauge per logical CPU. One read is not a
+/// delta, so say so rather than print a confident zero.
+fn load_rows(host: &Host, stats: &Stats) -> Vec<Row> {
+    let mut rows = vec![Row::header("Load")];
+
+    if !stats.primed() {
+        rows.push(Row::note("sampling, refresh in a moment"));
 
         return rows;
     }
-    if !stats.primed() {
-        rows.push(Row::Header("Load".into()));
-        rows.push(Row::note("sampling, refresh in a moment"));
-    } else {
-        if let Some(avg) = mean(&usages) {
-            let (load1, load5, load15) = stats.load();
-            rows.push(Row::Header("Load".into()));
-            rows.push(Row::field_with("Total", format!("{avg:.0}%"), avg / 100.0));
-            rows.push(Row::field(
-                "Average",
-                format!("{load1:.2}  {load5:.2}  {load15:.2}"),
-            ));
-            rows.push(Row::field("Threads", stats.process_load()));
-            if let Some(idle) = stats.idle_since_boot() {
-                rows.push(Row::field("Idle since boot", format!("{idle:.1}%")));
-            }
-        }
 
-        rows.push(Row::Header("Per-core load".into()));
-        for (idx, usage) in usages.iter().enumerate() {
-            let cur = read_u64(format!(
-                "/sys/devices/system/cpu/cpu{idx}/cpufreq/scaling_cur_freq"
-            ))
-            .map(|k| k / 1000);
-            let name = stats
-                .core_names()
-                .get(idx)
-                .cloned()
-                .unwrap_or_else(|| format!("cpu{idx}"));
-            let value = match cur {
-                Some(mhz) if mhz > 0 => format!("{usage:>3.0}%  {}", human_mhz(mhz)),
-                _ => format!("{usage:>3.0}%"),
-            };
-            rows.push(Row::field_with(name, value, usage / 100.0));
-        }
+    let avg = stats.cpu_usage();
+    let load = stats.load();
+    rows.push(Row::field_with("Total", format!("{avg:.0}%"), avg / 100.0));
+    rows.push(Row::field(
+        "Average",
+        format!("{:.2}  {:.2}  {:.2}", load.one, load.five, load.fifteen),
+    ));
+    rows.push(Row::field(
+        "Threads",
+        format!("{} runnable / {} threads", load.runnable, load.threads),
+    ));
+    if let Some(idle) = stats.idle_since_boot() {
+        rows.push(Row::field("Idle since boot", format!("{idle:.1}%")));
     }
 
-    let boot_epoch = super::system::boot_epoch();
-    if boot_epoch > 0 {
-        rows.push(Row::Header("Time".into()));
-        rows.push(Row::field("Since boot", human_secs(stats.uptime())));
-        rows.push(Row::field("Boot epoch", boot_epoch.to_string()));
+    rows.push(Row::header("Per-core load"));
+    for core in stats.cores() {
+        // Keyed by the core's own name: with a CPU offline, the position in
+        // the list is not the CPU number.
+        let mhz = host
+            .read_u64(format!(
+                "/sys/devices/system/cpu/{}/cpufreq/scaling_cur_freq",
+                core.name
+            ))
+            .map(|k| k / 1000)
+            .filter(|mhz| *mhz > 0);
+        let usage = core.usage;
+        let value = match mhz {
+            Some(mhz) => format!("{usage:>3.0}%  {}", human_mhz(mhz)),
+            None => format!("{usage:>3.0}%"),
+        };
+        rows.push(Row::field_with(core.name.as_str(), value, usage / 100.0));
     }
 
     rows
 }
 
 /// Physical cores from the topology exposed in sysfs, if the kernel shares it.
-fn physical_cores() -> Option<usize> {
-    let mut ids: Vec<(String, String)> = Vec::new();
-    for entry in super::fs::list_dir("/sys/devices/system/cpu") {
-        let Some(name) = entry.file_name().map(|n| n.to_string_lossy().to_string()) else {
-            continue;
-        };
-        if !name.starts_with("cpu") || name.contains('-') {
+fn physical_cores(host: &Host) -> Option<usize> {
+    let mut ids = HashSet::new();
+
+    for entry in list_dir(host.path("/sys/devices/system/cpu")) {
+        let name = super::fs::file_name(&entry);
+        let is_cpu = name
+            .strip_prefix("cpu")
+            .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit()));
+        if !is_cpu {
             continue;
         }
         // A CPU that is offline, or on a kernel without topology, has no such
         // file. Bailing out of the whole function on the first one threw away
         // the topology for every other CPU and silently fell back to a guess.
         let (Some(package), Some(core)) = (
-            read(entry.join("topology/physical_package_id")),
-            read(entry.join("topology/core_id")),
+            read_u64(entry.join("topology/physical_package_id")),
+            read_u64(entry.join("topology/core_id")),
         ) else {
             continue;
         };
-        ids.push((package, core));
+        ids.insert((package, core));
     }
-    (!ids.is_empty()).then(|| {
-        let mut unique: Vec<(String, String)> = Vec::new();
-        for id in ids {
-            if !unique.contains(&id) {
-                unique.push(id);
-            }
-        }
-        unique.len()
-    })
-}
 
-fn mean(values: &[f64]) -> Option<f64> {
-    if values.is_empty() {
-        return None;
-    }
-    Some(values.iter().sum::<f64>() / values.len() as f64)
+    (!ids.is_empty()).then_some(ids.len())
 }
 
 fn line_value(cpuinfo: &str, key: &str) -> Option<String> {
@@ -191,13 +216,9 @@ fn line_value(cpuinfo: &str, key: &str) -> Option<String> {
         // a longer key sharing the prefix ("model name extra") cannot match.
         let rest = l.strip_prefix(key)?.trim_start();
         let value = rest.strip_prefix(':')?;
+
         Some(value.trim().to_string())
     })
-}
-
-/// Group the ~50 CPU flags into the few that actually explain what this chip can do.
-fn flag_summary() -> String {
-    parse_flags(&cpuinfo())
 }
 
 /// How many CPUs a sysfs list names. `0-15` is 16, `0-3,8-11` is 8.
@@ -220,67 +241,55 @@ fn count_cpu_list(list: &str) -> Option<u64> {
             count = count.saturating_add(1);
         }
     }
+
     (count > 0).then_some(count)
 }
 
+/// Group the ~100 CPU flags into the few that explain what this chip can do.
 fn parse_flags(cpuinfo: &str) -> String {
-    let Some(line) = cpuinfo.lines().find(|l| l.starts_with("flags")) else {
-        return "-".to_string();
-    };
-    let flags: Vec<&str> = line
-        .split(':')
-        .nth(1)
-        .map(|f| f.split_whitespace().collect())
+    let flags: Vec<&str> = cpuinfo
+        .lines()
+        .find(|l| l.starts_with("flags"))
+        .and_then(|l| l.split_once(':'))
+        .map(|(_, f)| f.split_whitespace().collect())
         .unwrap_or_default();
     if flags.is_empty() {
         return "-".to_string();
     }
-    let has = |needle: &str| flags.contains(&needle);
-    // Note: the virtualisation mark is reported as vmx/svm because that is
-    // what the flag is actually called, and smep is smep -- it says nothing
-    // about simultaneous multithreading.
-    let mut marks = vec![
-        ("avx2", has("avx2")),
-        ("avx512", has("avx512f")),
-        ("fma", has("fma")),
-        ("aes", has("aes")),
-        ("sha_ni", has("sha_ni")),
-        ("vt_x", has("vmx")),
-        ("amd_v", has("svm")),
-        ("smep", has("smep")),
-        ("hypervisor", has("hypervisor")),
-    ];
-    marks.retain(|(_, on)| *on);
-    let joined = marks
-        .iter()
-        .map(|(name, _)| *name)
-        .collect::<Vec<_>>()
-        .join(" ");
-    format!("{joined}  (+{} more)", flags.len())
-}
 
-#[cfg(test)]
-fn parse_idle_hint(stat: &str) -> Option<String> {
-    let first = stat.lines().next()?;
-    let mut parts = first.split_whitespace();
-    if parts.next()? != "cpu" {
-        return None;
+    let has = |needle: &str| flags.contains(&needle);
+    // The virtualisation mark is reported as vmx/svm because that is what the
+    // flag is actually called, and smep is smep -- it says nothing about
+    // simultaneous multithreading.
+    let marks: Vec<&str> = [
+        ("avx2", "avx2"),
+        ("avx512", "avx512f"),
+        ("fma", "fma"),
+        ("aes", "aes"),
+        ("sha_ni", "sha_ni"),
+        ("vt_x", "vmx"),
+        ("amd_v", "svm"),
+        ("smep", "smep"),
+        ("hypervisor", "hypervisor"),
+    ]
+    .into_iter()
+    .filter(|(_, flag)| has(flag))
+    .map(|(name, _)| name)
+    .collect();
+
+    // Each mark stands for exactly one flag, so the rest is the difference.
+    let rest = flags.len() - marks.len();
+    match (marks.is_empty(), rest) {
+        (true, _) => format!("{rest} flags"),
+        (false, 0) => marks.join(" "),
+        (false, _) => format!("{}  (+{rest} more)", marks.join(" ")),
     }
-    let values: Vec<f64> = parts.filter_map(|v| v.parse().ok()).collect();
-    if values.len() < 5 {
-        return None;
-    }
-    let total: f64 = values.iter().sum();
-    let idle = values[3] + values[4];
-    if total <= 0.0 {
-        return None;
-    }
-    Some(format!("{:.0}% idle", idle / total * 100.0))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::fixture::Fixture;
 
     const X86_CPUINFO: &str = "\
 processor\t: 0
@@ -379,9 +388,8 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep aes avx2 avx512f fma sha_
     #[test]
     fn parse_flags_reports_how_many_were_left_out() {
         let s = parse_flags(X86_CPUINFO);
-        assert!(s.contains("(+"), "expected a remainder count: {s:?}");
-        // 19 flags in the fixture, 8 of them named.
-        assert!(s.contains("19"), "{s:?}");
+        // 19 flags in the fixture, 8 of them named: 11 left out, not 19.
+        assert!(s.ends_with("  (+11 more)"), "{s:?}");
     }
 
     #[test]
@@ -408,61 +416,127 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep aes avx2 avx512f fma sha_
     }
 
     #[test]
+    fn parse_flags_with_every_flag_named_has_no_remainder() {
+        assert_eq!(parse_flags("flags\t\t: avx2 aes\n"), "avx2 aes");
+    }
+
+    #[test]
     fn parse_flags_with_nothing_recognised_still_reports_the_count() {
         let s = parse_flags("flags\t\t: fpu vme de pse tsc\n");
-        assert!(s.contains("(+5 more)"), "{s:?}");
+        assert_eq!(s, "5 flags", "nothing named, so nothing is 'more'");
     }
 
-    // ---- parse_idle_hint -------------------------------------------------
+    // ---- CpuInfo -----------------------------------------------------------
 
     #[test]
-    fn parse_idle_hint_uses_idle_plus_iowait() {
-        // user 100, nice 0, system 100, idle 700, iowait 100 -> 800/1000
-        let stat = "cpu  100 0 100 700 100 0 0 0\ncpu0 100 0 100 700 100 0 0 0\n";
-        assert_eq!(parse_idle_hint(stat).as_deref(), Some("80% idle"));
+    fn microcode_comes_from_sysfs_without_a_doubled_prefix() {
+        // The old path, cpufreq/microcode, does not exist, so the row was
+        // always "-"; and sysfs already prints the 0x.
+        let fx = Fixture::new();
+        fx.write("proc/cpuinfo", X86_CPUINFO);
+        fx.write("sys/devices/system/cpu/cpu0/microcode/version", "0x4121\n");
+
+        let info = CpuInfo::read(&fx.host());
+        assert_eq!(info.microcode.as_deref(), Some("0x4121"));
     }
 
     #[test]
-    fn parse_idle_hint_rounds_to_whole_percent() {
-        let stat = "cpu  1 0 0 2 0 0 0 0\n";
-        assert_eq!(parse_idle_hint(stat).as_deref(), Some("67% idle"));
-    }
-
-    #[test]
-    fn parse_idle_hint_needs_five_columns_and_a_cpu_first_line() {
-        assert_eq!(parse_idle_hint("cpu 1 2 3 4\n"), None, "too few columns");
-        assert_eq!(
-            parse_idle_hint("intr 1 2 3 4 5\n"),
-            None,
-            "not the cpu line"
+    fn microcode_falls_back_to_cpuinfo() {
+        let fx = Fixture::new();
+        fx.write(
+            "proc/cpuinfo",
+            &format!("{X86_CPUINFO}microcode\t: 0xa404102\n"),
         );
-        assert_eq!(parse_idle_hint(""), None);
+
+        let info = CpuInfo::read(&fx.host());
+        assert_eq!(info.microcode.as_deref(), Some("0xa404102"));
     }
 
     #[test]
-    fn parse_idle_hint_refuses_a_zero_total() {
-        assert_eq!(parse_idle_hint("cpu  0 0 0 0 0 0 0 0\n"), None);
+    fn a_bare_microcode_revision_gets_its_prefix() {
+        assert_eq!(with_hex_prefix("4121"), "0x4121");
+        assert_eq!(with_hex_prefix("0x4121"), "0x4121");
     }
 
-    // ---- mean ------------------------------------------------------------
+    // ---- rows() against a fixture -----------------------------------------
 
-    #[test]
-    fn mean_averages_the_samples() {
-        assert_eq!(mean(&[0.0, 100.0]), Some(50.0));
-        assert_eq!(mean(&[25.0]), Some(25.0));
-        assert_eq!(mean(&[]), None, "an empty set has no mean");
+    fn machine() -> Fixture {
+        let fx = Fixture::new();
+        fx.write("proc/cpuinfo", X86_CPUINFO);
+        fx.write("proc/stat", "cpu 0 0 0 0\ncpu0 0 0 0 0\ncpu2 0 0 0 0\n");
+        fx.write("proc/uptime", "100.0 100.0\n");
+        fx.write("proc/loadavg", "0.10 0.20 0.30 1/200 1\n");
+        for (cpu, core) in [("cpu0", "0"), ("cpu1", "0"), ("cpu2", "1")] {
+            let base = format!("sys/devices/system/cpu/{cpu}");
+            fx.write(&format!("{base}/topology/physical_package_id"), "0\n");
+            fx.write(&format!("{base}/topology/core_id"), &format!("{core}\n"));
+        }
+        fx.write(
+            "sys/devices/system/cpu/cpu2/cpufreq/scaling_cur_freq",
+            "2400000\n",
+        );
+        fx.write("sys/devices/system/cpu/online", "0,2\n");
+        fx
     }
 
-    // ---- rows() against the live machine ---------------------------------
+    fn primed(fx: &Fixture) -> Stats {
+        let host = fx.host();
+        let mut stats = Stats::new(&host);
+        fx.write("proc/stat", "cpu 0 0 0 0\ncpu0 50 0 0 50\ncpu2 100 0 0 0\n");
+        std::thread::sleep(std::time::Duration::from_millis(110));
+        stats.sample(&host);
+        stats
+    }
+
+    fn text(rows: &[Row]) -> String {
+        format!("{rows:?}")
+    }
 
     #[test]
-    fn rows_renders_without_panicking_on_this_machine() {
-        let mut stats = Stats::new();
-        let rows = rows(&mut stats);
-        assert!(!rows.is_empty());
-        let text: String = rows.iter().map(|r| format!("{r:?}")).collect();
-        assert!(!text.contains("NaN"), "a NaN leaked into the CPU rows");
-        assert!(!text.contains('∞'), "an infinity leaked into the CPU rows");
+    fn rows_count_physical_cores_from_the_topology() {
+        let fx = machine();
+        let host = fx.host();
+        let rows = rows(&host, &primed(&fx), &CpuInfo::read(&host));
+
+        assert!(text(&rows).contains("\"2 / 2\""), "{}", text(&rows));
+    }
+
+    #[test]
+    fn per_core_frequency_is_read_for_the_named_core() {
+        // cpu1 is offline: the second core in the list is cpu2, and its
+        // frequency lives under cpu2, not cpu1.
+        let fx = machine();
+        let host = fx.host();
+        let rows = rows(&host, &primed(&fx), &CpuInfo::read(&host));
+        let cpu2 = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Field { label, value, .. } if label == "cpu2" => Some(value.to_string()),
+                _ => None,
+            })
+            .expect("a cpu2 row");
+
+        assert!(cpu2.contains("2.40 GHz"), "{cpu2}");
+        assert!(cpu2.contains("100%"), "{cpu2}");
+    }
+
+    #[test]
+    fn an_unsampled_machine_says_it_is_still_sampling() {
+        let fx = machine();
+        let host = fx.host();
+        let rows = rows(&host, &Stats::new(&host), &CpuInfo::read(&host));
+
+        assert!(text(&rows).contains("sampling"), "{}", text(&rows));
+    }
+
+    #[test]
+    fn a_machine_without_topology_does_not_guess() {
+        let fx = Fixture::new();
+        fx.write("proc/stat", "cpu 0 0 0 0\ncpu0 0 0 0 0\ncpu1 0 0 0 0\n");
+        let host = fx.host();
+        let rows = rows(&host, &Stats::new(&host), &CpuInfo::read(&host));
+
+        assert!(text(&rows).contains("? / 2"), "{}", text(&rows));
     }
 
     #[test]
@@ -478,11 +552,5 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep aes avx2 avx512f fma sha_
         );
         assert_eq!(count_cpu_list("online"), None);
         assert_eq!(count_cpu_list(""), None);
-    }
-
-    #[test]
-    fn brand_and_flags_always_produce_something() {
-        assert!(!brand().is_empty());
-        assert!(!flag_summary().is_empty());
     }
 }

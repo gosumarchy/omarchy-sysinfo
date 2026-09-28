@@ -1,15 +1,22 @@
-//! Terminal handling with no crates: raw mode via `stty`, size via `TIOCGWINSZ`,
-//! and drawing with 24-bit ANSI escapes onto a cell buffer we own.
+//! Terminal handling with no crates: raw mode via `stty`, size via
+//! `TIOCGWINSZ`, and drawing with 24-bit ANSI escapes onto a cell buffer we
+//! own.
 
 use std::fmt::Write as _;
 use std::io::{self, Write};
-use std::os::raw::{c_int, c_ulong};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::collect::Bar;
+use crate::text::char_width;
+
+/// Leave the alternate screen with the cursor visible and colours reset.
+const LEAVE: &[u8] = b"\x1b[0m\x1b[?25h\x1b[?1049l";
+/// Enter the alternate screen, hide the cursor, clear, and home.
+const ENTER: &[u8] = b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H";
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Color {
+pub(crate) enum Color {
     Default,
     Rgb(u8, u8, u8),
 }
@@ -39,15 +46,15 @@ impl Color {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Style {
-    pub fg: Color,
-    pub bg: Color,
-    pub bold: bool,
-    pub dim: bool,
+pub(crate) struct Style {
+    pub(crate) fg: Color,
+    pub(crate) bg: Color,
+    pub(crate) bold: bool,
+    pub(crate) dim: bool,
 }
 
 impl Style {
-    pub fn new(fg: Color) -> Style {
+    pub(crate) fn new(fg: Color) -> Style {
         Style {
             fg,
             bg: Color::Default,
@@ -56,84 +63,116 @@ impl Style {
         }
     }
 
-    pub fn on(mut self, bg: Color) -> Style {
+    pub(crate) fn on(mut self, bg: Color) -> Style {
         self.bg = bg;
         self
     }
 
-    pub fn bold(mut self) -> Style {
+    pub(crate) fn bold(mut self) -> Style {
         self.bold = true;
         self
     }
 
-    pub fn dim(mut self) -> Style {
+    pub(crate) fn dim(mut self) -> Style {
         self.dim = true;
         self
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Marks the second cell of a double-width character. The terminal draws the
+/// character across both cells, so `render` must print nothing for this one.
+/// NUL can never be real content: every string is sanitised before it gets
+/// here.
+const CONTINUATION: char = '\0';
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct Cell {
     ch: char,
     style: Style,
 }
 
 /// A grid of styled characters that we render in one pass.
-pub struct Buffer {
+#[derive(Debug)]
+pub(crate) struct Buffer {
     width: u16,
     height: u16,
     cells: Vec<Cell>,
+    blank: Style,
 }
 
 impl Buffer {
-    pub fn new(width: u16, height: u16, blank: Style) -> Buffer {
+    pub(crate) fn new(width: u16, height: u16, blank: Style) -> Buffer {
         Buffer {
             width,
             height,
             cells: vec![
                 Cell {
                     ch: ' ',
-                    style: blank,
+                    style: blank
                 };
-                width as usize * height as usize
+                usize::from(width) * usize::from(height)
             ],
+            blank,
         }
     }
 
-    pub fn width(&self) -> u16 {
+    pub(crate) fn width(&self) -> u16 {
         self.width
     }
 
-    pub fn height(&self) -> u16 {
+    pub(crate) fn height(&self) -> u16 {
         self.height
     }
 
-    /// Draw `text` at `x,y`, clipped to the buffer. Returns the x after the text.
-    pub fn put(&mut self, x: u16, y: u16, text: &str, style: Style) -> u16 {
+    /// Draw `text` at `x,y`, clipped to the buffer. Returns the x after the
+    /// text.
+    ///
+    /// Wide characters take two cells and zero-width ones none, so the
+    /// returned column is where the terminal's cursor will really be. A wide
+    /// character that would straddle the right edge is drawn as a space: half
+    /// of it would make the terminal wrap and shift the whole frame.
+    pub(crate) fn put(&mut self, x: u16, y: u16, text: &str, style: Style) -> u16 {
         if y >= self.height {
             return x;
         }
+
         let mut cursor = x;
         for ch in text.chars() {
             if cursor >= self.width {
                 break;
             }
-            self.set(cursor, y, ch, style);
-            cursor += 1;
+            match char_width(ch) {
+                0 => {}
+                1 => {
+                    self.set(cursor, y, ch, style);
+                    cursor += 1;
+                }
+                _ if cursor + 1 < self.width => {
+                    self.set(cursor, y, ch, style);
+                    self.set(cursor + 1, y, CONTINUATION, style);
+                    cursor += 2;
+                }
+                _ => {
+                    self.set(cursor, y, ' ', style);
+                    cursor += 1;
+                }
+            }
         }
+
         cursor
     }
 
     /// Draw `text` right-aligned so it ends at `x` (exclusive).
-    pub fn put_right(&mut self, x: u16, y: u16, text: &str, style: Style) {
-        let len = text.chars().count() as u16;
+    pub(crate) fn put_right(&mut self, x: u16, y: u16, text: &str, style: Style) {
+        let len = u16::try_from(crate::text::width(text)).unwrap_or(u16::MAX);
         if len >= x {
             return;
         }
+
         self.put(x - len, y, text, style);
     }
 
-    pub fn fill_row(&mut self, y: u16, ch: char, style: Style) {
+    pub(crate) fn fill_row(&mut self, y: u16, ch: char, style: Style) {
         if y >= self.height {
             return;
         }
@@ -142,34 +181,49 @@ impl Buffer {
         }
     }
 
+    /// Put one character in one cell, keeping wide characters whole.
+    ///
+    /// Writing over either half of a wide character would leave the other
+    /// half orphaned, and the terminal would draw the survivor across a cell
+    /// that now belongs to something else. The orphan is blanked instead.
     fn set(&mut self, x: u16, y: u16, ch: char, style: Style) {
         if x >= self.width || y >= self.height {
             return;
         }
         let index = self.index(x, y);
+
+        if self.cells[index].ch == CONTINUATION && ch != CONTINUATION && x > 0 {
+            self.cells[index - 1] = Cell {
+                ch: ' ',
+                style: self.blank,
+            };
+        }
+        if x + 1 < self.width && self.cells[index + 1].ch == CONTINUATION {
+            self.cells[index + 1] = Cell {
+                ch: ' ',
+                style: self.blank,
+            };
+        }
+
         self.cells[index] = Cell { ch, style };
     }
 
     /// Where `(x, y)` lands in the flat cell vector.
     fn index(&self, x: u16, y: u16) -> usize {
-        y as usize * self.width as usize + x as usize
+        usize::from(y) * usize::from(self.width) + usize::from(x)
     }
 
     /// Horizontal rule across `x..end` on row `y`.
-    pub fn hline(&mut self, x: u16, y: u16, end: u16, ch: char, style: Style) {
-        let mut cursor = x;
-        while cursor < end && cursor < self.width {
+    pub(crate) fn hline(&mut self, x: u16, y: u16, end: u16, ch: char, style: Style) {
+        for cursor in x..end.min(self.width) {
             self.set(cursor, y, ch, style);
-            cursor += 1;
         }
     }
 
     /// Vertical rule down column `x` from `y` to `y_end`.
-    pub fn vline(&mut self, x: u16, y: u16, y_end: u16, ch: char, style: Style) {
-        let mut row = y;
-        while row < y_end && row < self.height {
+    pub(crate) fn vline(&mut self, x: u16, y: u16, y_end: u16, ch: char, style: Style) {
+        for row in y..y_end.min(self.height) {
             self.set(x, row, ch, style);
-            row += 1;
         }
     }
 
@@ -177,21 +231,31 @@ impl Buffer {
     ///
     /// The clamp lives in `Bar::new`, so this cannot be handed a ratio outside
     /// `0.0..=1.0` and does not repeat the check.
-    pub fn gauge(&mut self, x: u16, y: u16, width: u16, bar: Bar, style: Style, empty: Style) {
-        let filled = ((bar.frac() * width as f64).round() as u16).min(width);
+    pub(crate) fn gauge(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        bar: Bar,
+        style: Style,
+        empty: Style,
+    ) {
+        let filled = crate::collect::units::round_u64(bar.frac() * f64::from(width));
+
         for offset in 0..width {
-            let ch = if offset < filled { '█' } else { '░' };
-            self.set(
-                x + offset,
-                y,
-                ch,
-                if offset < filled { style } else { empty },
-            );
+            let Some(column) = x.checked_add(offset) else {
+                break;
+            };
+            if u64::from(offset) < filled {
+                self.set(column, y, '█', style);
+            } else {
+                self.set(column, y, '░', empty);
+            }
         }
     }
 
     /// Serialise to a string of ANSI escapes, skipping runs of equal style.
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let mut out = String::with_capacity(self.cells.len() * 8);
         out.push_str("\x1b[H");
         let mut current: Option<Style> = None;
@@ -199,11 +263,18 @@ impl Buffer {
         // `chunks` walks the rows without recomputing `y * width + x` per cell.
         // The width is forced to at least one because a zero-width buffer has
         // no rows to hand out, and `chunks(0)` panics.
-        for (y, cells) in self.cells.chunks(self.width.max(1) as usize).enumerate() {
+        for (y, cells) in self
+            .cells
+            .chunks(usize::from(self.width.max(1)))
+            .enumerate()
+        {
             if y > 0 {
                 out.push_str("\r\n\x1b[K");
             }
             for cell in cells {
+                if cell.ch == CONTINUATION {
+                    continue;
+                }
                 if current != Some(cell.style) {
                     if current.is_some() {
                         out.push_str("\x1b[0m");
@@ -225,38 +296,92 @@ impl Buffer {
                 current = None;
             }
         }
+
         out
     }
 }
 
-/// Owns raw mode for the lifetime of the program and restores it on drop.
-pub struct Terminal {
-    saved_stty: Option<String>,
+/// Owns raw mode and the alternate screen, and gives both back on drop, on
+/// panic, and on a failure halfway through entering them.
+#[derive(Debug)]
+pub(crate) struct Terminal {
+    restore: Restore,
     size: (u16, u16),
 }
 
-impl Terminal {
-    pub fn enter() -> io::Result<Terminal> {
-        let saved_stty = stty(&["-g"]);
-        // Raw mode with no echo; the shell is restored on the way out.
-        let _ = stty(&["raw", "-echo"]);
-        let size = terminal_size();
-        let mut out = io::stdout();
-        out.write_all(b"\x1b[?1049h\x1b[?25l\x1b[2J\x1b[H")?;
-        out.flush()?;
-        Ok(Terminal { saved_stty, size })
+/// What it takes to put the terminal back, shared with the panic hook.
+///
+/// The release profile aborts on panic, so `Drop` never runs then; the hook
+/// is the only chance to leave the user a working shell. `Option::take`
+/// makes restoring idempotent, since in a debug build both run.
+#[derive(Clone, Debug)]
+struct Restore(Arc<Mutex<Option<String>>>);
+
+impl Restore {
+    fn new(saved_stty: String) -> Restore {
+        Restore(Arc::new(Mutex::new(Some(saved_stty))))
     }
 
-    pub fn size(&self) -> (u16, u16) {
+    fn run(&self) {
+        let saved = self.0.lock().unwrap_or_else(PoisonError::into_inner).take();
+        let Some(saved) = saved else {
+            return;
+        };
+
+        let mut out = io::stdout();
+        let _ = out.write_all(LEAVE);
+        let _ = out.flush();
+        if !saved.is_empty() {
+            let _ = stty(&[&saved]);
+        }
+    }
+}
+
+impl Terminal {
+    /// Switch to raw mode and the alternate screen.
+    ///
+    /// The guard exists before the first change is made, so an error on any
+    /// later step (a closed stdout, say) still restores the terminal on the
+    /// way out, instead of leaving the shell without echo.
+    pub(crate) fn enter() -> io::Result<Terminal> {
+        let saved = stty(&["-g"])
+            .ok_or_else(|| io::Error::other("stty could not read the terminal settings"))?;
+        let restore = Restore::new(saved);
+        let terminal = Terminal {
+            restore: restore.clone(),
+            size: terminal_size(),
+        };
+
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            restore.run();
+            previous(info);
+        }));
+
+        // Raw mode with no echo; the shell is restored on the way out.
+        stty(&["raw", "-echo"]).ok_or_else(|| io::Error::other("stty could not set raw mode"))?;
+        let mut out = io::stdout();
+        out.write_all(ENTER)?;
+        out.flush()?;
+
+        Ok(terminal)
+    }
+
+    pub(crate) fn size(&self) -> (u16, u16) {
         self.size
     }
 
-    pub fn refresh_size(&mut self) {
+    pub(crate) fn refresh_size(&mut self) {
         self.size = terminal_size();
     }
 
-    pub fn draw(&mut self, buffer: &Buffer) -> io::Result<()> {
-        let mut out = io::stdout();
+    #[expect(
+        clippy::unused_self,
+        reason = "owning the Terminal is what proves raw mode and the alternate screen are on"
+    )]
+    pub(crate) fn draw(&mut self, buffer: &Buffer) -> io::Result<()> {
+        let mut out = io::stdout().lock();
+
         out.write_all(buffer.render().as_bytes())?;
         out.flush()
     }
@@ -264,64 +389,38 @@ impl Terminal {
 
 impl Drop for Terminal {
     fn drop(&mut self) {
-        if let Some(saved) = &self.saved_stty {
-            let _ = stty(&[saved]);
-        }
-        let mut out = io::stdout();
-        let _ = out.write_all(b"\x1b[0m\x1b[?25h\x1b[?1049l");
-        let _ = out.flush();
+        self.restore.run();
     }
 }
 
+/// Run `stty` against our terminal and return what it printed. `Some("")`
+/// is success with no output.
 fn stty(args: &[&str]) -> Option<String> {
     let out = Command::new("stty")
         .args(args)
-        .stdin(std::process::Stdio::inherit())
+        .stdin(Stdio::inherit())
+        .stderr(Stdio::null())
         .output()
         .ok()?;
-    let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!text.is_empty()).then_some(text)
+
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
 /// Width and height: `TIOCGWINSZ`, then `stty size`, then the environment.
 ///
 /// The ioctl is the path a redraw takes. `stty` stays only for a terminal that
 /// will not answer the syscall, so a resize still cannot fork on every frame.
-pub fn terminal_size() -> (u16, u16) {
-    for fd in [0, 1] {
-        if let Some(size) = ioctl_size(fd) {
-            return size;
-        }
+pub(crate) fn terminal_size() -> (u16, u16) {
+    if let Some(size) = [0, 1].into_iter().find_map(crate::sys::window_size) {
+        return size;
     }
-    if let Some(out) = stty(&["size"]) {
-        if let Some(size) = parse_size(&out) {
-            return size;
-        }
+    if let Some(size) = stty(&["size"]).and_then(|out| parse_size(&out)) {
+        return size;
     }
+
     (env_dim("COLUMNS", 100), env_dim("LINES", 30))
-}
-
-#[repr(C)]
-#[derive(Default)]
-struct Winsize {
-    ws_row: u16,
-    ws_col: u16,
-    ws_xpixel: u16,
-    ws_ypixel: u16,
-}
-
-const TIOCGWINSZ: c_ulong = 0x5413;
-
-extern "C" {
-    fn ioctl(fd: c_int, request: c_ulong, arg: *mut Winsize) -> c_int;
-}
-
-fn ioctl_size(fd: i32) -> Option<(u16, u16)> {
-    let mut size = Winsize::default();
-    if unsafe { ioctl(fd, TIOCGWINSZ, &mut size) } < 0 {
-        return None;
-    }
-    size_if_nonzero(size.ws_col, size.ws_row)
 }
 
 fn size_if_nonzero(cols: u16, rows: u16) -> Option<(u16, u16)> {
@@ -333,6 +432,7 @@ fn parse_size(text: &str) -> Option<(u16, u16)> {
     let mut parts = text.split_whitespace();
     let rows = parts.next()?.parse::<u16>().ok()?;
     let cols = parts.next()?.parse::<u16>().ok()?;
+
     size_if_nonzero(cols, rows)
 }
 
@@ -357,11 +457,14 @@ mod tests {
 
     /// The visible characters of one row, ignoring style.
     fn row(b: &Buffer, y: u16) -> String {
-        (0..b.width).map(|x| b.cells[b.index(x, y)].ch).collect()
+        (0..b.width)
+            .map(|x| b.cells[b.index(x, y)].ch)
+            .filter(|ch| *ch != CONTINUATION)
+            .collect()
     }
 
     fn cell(b: &Buffer, x: u16, y: u16) -> Cell {
-        b.cells[y as usize * b.width as usize + x as usize]
+        b.cells[b.index(x, y)]
     }
 
     // ---- construction ----------------------------------------------------
@@ -735,11 +838,6 @@ mod tests {
     }
 
     #[test]
-    fn ioctl_size_rejects_a_fd_that_is_not_a_terminal() {
-        assert_eq!(ioctl_size(-1), None);
-    }
-
-    #[test]
     fn parse_size_rejects_junk_and_degenerate_values() {
         assert_eq!(parse_size(""), None);
         assert_eq!(parse_size("80"), None, "missing column count");
@@ -748,5 +846,79 @@ mod tests {
         assert_eq!(parse_size("24 0"), None, "zero columns");
         assert_eq!(parse_size("-1 80"), None);
         assert_eq!(parse_size("99999 80"), None, "out of u16 range");
+    }
+
+    // ---- wide characters -----------------------------------------------------
+
+    #[test]
+    fn a_wide_character_takes_two_cells() {
+        let mut b = buf(6, 1);
+        let end = b.put(0, 0, "日本", Style::new(Color::Default));
+
+        assert_eq!(end, 4);
+        assert_eq!(row(&b, 0), "日本  ");
+        assert_eq!(cell(&b, 1, 0).ch, CONTINUATION);
+    }
+
+    #[test]
+    fn a_wide_character_that_would_straddle_the_edge_becomes_a_space() {
+        let mut b = buf(3, 1);
+        let end = b.put(0, 0, "a日本", Style::new(Color::Default));
+
+        assert_eq!(end, 3);
+        assert_eq!(row(&b, 0), "a日");
+        let mut b = buf(2, 1);
+        b.put(1, 0, "日", Style::new(Color::Default));
+        assert_eq!(row(&b, 0), "  ", "half a wide char would wrap the line");
+    }
+
+    #[test]
+    fn a_combining_mark_takes_no_cell() {
+        let mut b = buf(4, 1);
+
+        assert_eq!(b.put(0, 0, "e\u{301}x", Style::new(Color::Default)), 2);
+    }
+
+    #[test]
+    fn overwriting_half_of_a_wide_character_blanks_the_other_half() {
+        let mut b = buf(4, 1);
+        b.put(0, 0, "日", Style::new(Color::Default));
+        b.put(1, 0, "x", Style::new(Color::Default));
+        assert_eq!(row(&b, 0), " x  ");
+
+        let mut b = buf(4, 1);
+        b.put(0, 0, "日", Style::new(Color::Default));
+        b.put(0, 0, "y", Style::new(Color::Default));
+        assert_eq!(row(&b, 0), "y   ");
+    }
+
+    #[test]
+    fn render_skips_the_continuation_cell() {
+        let mut b = buf(3, 1);
+        b.put(0, 0, "日x", Style::new(Color::Default));
+        let out = b.render();
+
+        assert!(out.contains("日x"), "{out:?}");
+        assert!(!out.contains('\0'), "{out:?}");
+    }
+
+    #[test]
+    fn put_right_measures_display_width() {
+        let mut b = buf(6, 1);
+        b.put_right(6, 0, "日", Style::new(Color::Default));
+
+        assert_eq!(row(&b, 0), "    日");
+    }
+
+    // ---- restore -------------------------------------------------------------
+
+    #[test]
+    fn restoring_twice_is_harmless() {
+        // The panic hook and Drop both restore in a debug build.
+        let restore = Restore::new(String::new());
+        restore.run();
+        restore.run();
+
+        assert!(restore.0.lock().expect("lock").is_none());
     }
 }

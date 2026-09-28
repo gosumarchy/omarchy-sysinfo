@@ -1,0 +1,5 @@
+# Tests assert by panicking; the panic-prevention lints guard product code.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-print-in-tests = true

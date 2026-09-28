@@ -1,229 +1,424 @@
-use super::{
-    fs::{read, read_u64},
-    units::human_bytes,
-    Row,
-};
-use std::path::Path;
+//! Disks, their partitions, and the filesystems that end up on them.
+//!
+//! The mapping from a disk to what is mounted from it is not one step on a
+//! modern install. Omarchy's default is LUKS with btrfs on top, so `/` is
+//! mounted from `/dev/mapper/root`, which is `dm-0`, which is held open on
+//! `nvme0n1p2`. Matching mount sources to partition names by string missed
+//! every one of those, and credited the disk with `/boot`'s usage instead.
+//! Here each partition follows its `holders` links up to whatever is
+//! mounted, however many device-mapper layers (LUKS, LVM) sit in between.
 
-pub fn rows() -> Vec<Row> {
-    let mounts = mount_table();
-    let usage = usage_table();
-    let mut rows = Vec::new();
-    let mut disks = 0usize;
+use std::path::{Path, PathBuf};
 
-    for block in super::fs::list_dir("/sys/block") {
-        let name = block
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        if name.starts_with("loop") || name.starts_with("ram") || name.starts_with("sr") {
-            continue;
-        }
-        let Some(size_sectors) = read_u64(block.join("size")) else {
-            continue;
-        };
-        let size = size_sectors.sectors_to_bytes();
-        if size == 0 {
-            continue;
-        }
-        disks += 1;
+use super::fs::{file_name, list_dir, read, read_u64};
+use super::units::{human_bytes, round_u64};
+use super::{Host, Row};
+use crate::sys::{FsUsage, fs_usage};
 
-        let rotational = read(block.join("queue/rotational")).as_deref() == Some("1");
-        // zram is compressed memory, not a disk: never call it an SSD.
-        let ram_disk = name.starts_with("zram")
-            || std::fs::read_link(&block)
-                .map(|t| t.to_string_lossy().contains("zram"))
-                .unwrap_or(false);
-        let model = read(block.join("device/model"))
-            .or_else(|| read(block.join("device/name")))
-            .unwrap_or_else(|| {
-                if rotational {
-                    "unknown rotational".to_string()
-                } else {
-                    "unknown".to_string()
-                }
-            });
-        let scheduler = read(block.join("queue/scheduler")).unwrap_or_default();
-        let rotational_label = if ram_disk {
-            "RAM disk"
-        } else if rotational {
-            "HDD"
-        } else {
-            "SSD / NVMe"
-        };
-        let mm = read(block.join("queue/logical_block_size"))
-            .map(|v| format!("{v} B"))
-            .unwrap_or_default();
+/// How deep a holder chain is followed. Real stacks are two or three deep
+/// (partition, LUKS, LVM); the limit only guards against a cycle.
+const MAX_HOLDER_DEPTH: usize = 8;
 
-        let mut mounted: Vec<String> = mounts
-            .iter()
-            .filter(|m| m.matches(&name))
-            .map(|m| format!("{} ({})", m.point, m.fstype))
-            .collect();
-        mounted.sort();
-        let usage = mounts
-            .iter()
-            .find(|m| m.matches(&name))
-            .and_then(|m| disk_usage(&usage, &m.dev));
+pub(crate) fn rows(host: &Host) -> Vec<Row> {
+    let mounts = mount_table(host);
+    let disks: Vec<Disk> = host
+        .list_dir("/sys/block")
+        .iter()
+        .filter_map(|path| Disk::read(path))
+        .collect();
 
-        rows.push(Row::Header(format!("{name}  ·  {rotational_label}")));
-        rows.push(Row::field("Capacity", human_bytes(size)));
-        rows.push(Row::field("Model", model));
-        if let Some(d) = read(block.join("device/wwid")) {
-            rows.push(Row::field("World-wide id", d));
-        }
-        if !mm.is_empty() {
-            rows.push(Row::field("Sector size", mm));
-        }
-        if !scheduler.is_empty() {
-            rows.push(Row::field("Scheduler", scheduler));
-        }
-        rows.push(Row::field(
-            "Removable",
-            dash_opt(read(block.join("removable"))),
-        ));
-        rows.push(Row::field(
-            "Mounted",
-            if mounted.is_empty() {
-                "-".to_string()
-            } else {
-                mounted.join(", ")
-            },
-        ));
-        if let Some((used, avail, pct)) = usage {
-            rows.push(Row::field_with(
-                "Usage",
-                format!("{used} used, {avail} free"),
-                pct / 100.0,
-            ));
-        }
-        if let Some(smart) = smart_summary(&block) {
-            rows.push(Row::field("SMART", smart));
-        }
-
-        let partitions: Vec<String> = super::fs::list_dir(&block)
-            .iter()
-            .filter(|p| read(p.join("partition")).is_some())
-            .filter_map(|p| p.file_name()?.to_str().map(str::to_string))
-            .collect();
-        for part in partitions {
-            let part_path = block.join(&part);
-            let part_size = read_u64(part_path.join("size"))
-                .map(|s| s.sectors_to_bytes())
-                .unwrap_or(0);
-            let fstype = mounts
-                .iter()
-                .find(|m| m.matches(&part))
-                .map(|m| m.fstype.clone())
-                .unwrap_or_else(|| "-".into());
-            let point = mounts
-                .iter()
-                .find(|m| m.matches(&part))
-                .map(|m| m.point.clone())
-                .unwrap_or_else(|| "-".into());
-            rows.push(Row::field(
-                format!("  {part}"),
-                format!("{}  {point}  {fstype}", human_bytes(part_size)),
-            ));
-        }
-    }
-
-    if disks == 0 {
+    if disks.is_empty() {
         return vec![Row::note("no block devices")];
     }
 
-    rows.push(Row::Header("Storage totals".into()));
-    rows.push(Row::field("Block devices", disks.to_string()));
-    if let Some(root) = root_disk() {
-        rows.push(Row::field("Root filesystem on", root));
+    let mut rows = Vec::new();
+    for disk in &disks {
+        rows.extend(disk_rows(host, disk, &mounts));
     }
-    if let Some(bcache) = btrfs_summary() {
-        rows.push(Row::field("Btrfs", bcache));
+
+    rows.push(Row::header("Storage totals"));
+    rows.push(Row::field("Block devices", disks.len().to_string()));
+    if let Some(root) = mounts.iter().find(|m| m.point == "/") {
+        rows.push(Row::field("Root filesystem on", describe_root(host, root)));
+        if root.fstype == "btrfs"
+            && let Some(summary) = root.device.as_deref().and_then(|d| btrfs_summary(host, d))
+        {
+            rows.push(Row::field("Btrfs", summary));
+        }
     }
-    if let Some(trim) = read("/sys/module/fstrim/parameters/enabled") {
-        rows.push(Row::field("fstrim", trim));
-    }
+    rows.push(Row::field("Periodic TRIM", fstrim_state(host)));
+
     rows
 }
 
-trait Sectors {
-    fn sectors_to_bytes(self) -> u64;
+/// What kind of device a disk is, as far as sysfs can tell.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Media {
+    Rotational,
+    SolidState,
+    /// zram: compressed memory, never an SSD.
+    Memory,
 }
 
-impl Sectors for u64 {
-    fn sectors_to_bytes(self) -> u64 {
-        // Saturating: a nonsense `size` must not wrap a huge disk into a tiny
-        // one, or panic in a debug build.
-        self.saturating_mul(512)
+impl Media {
+    fn label(self) -> &'static str {
+        match self {
+            Media::Rotational => "HDD",
+            Media::SolidState => "SSD / NVMe",
+            Media::Memory => "RAM disk",
+        }
     }
 }
 
-fn dash_opt(v: Option<String>) -> String {
-    match v {
-        Some(s) if s == "0" => "no".to_string(),
-        Some(s) if s == "1" => "yes".to_string(),
-        Some(s) => s,
-        None => "-".to_string(),
+/// A top-level entry of `/sys/block` that is a real disk.
+#[derive(Clone, Debug)]
+struct Disk {
+    name: String,
+    path: PathBuf,
+    size: u64,
+    media: Media,
+    partitions: Vec<Partition>,
+}
+
+#[derive(Clone, Debug)]
+struct Partition {
+    name: String,
+    path: PathBuf,
+    size: u64,
+}
+
+impl Disk {
+    fn read(path: &Path) -> Option<Disk> {
+        let name = file_name(path);
+        // Loop devices and optical drives are not storage anyone asks about,
+        // and device-mapper nodes (dm-N) are shown under the partition they
+        // sit on rather than as disks of their own.
+        if ["loop", "ram", "sr", "dm-"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            return None;
+        }
+
+        let size = sectors_to_bytes(read_u64(path.join("size"))?);
+        if size == 0 {
+            return None;
+        }
+
+        let media = if name.starts_with("zram") {
+            Media::Memory
+        } else if read(path.join("queue/rotational")).as_deref() == Some("1") {
+            Media::Rotational
+        } else {
+            Media::SolidState
+        };
+
+        let partitions = list_dir(path)
+            .into_iter()
+            .filter(|p| p.join("partition").exists())
+            .map(|p| Partition {
+                name: file_name(&p),
+                size: read_u64(p.join("size")).map_or(0, sectors_to_bytes),
+                path: p,
+            })
+            .collect();
+
+        Some(Disk {
+            name,
+            path: path.to_path_buf(),
+            size,
+            media,
+            partitions,
+        })
     }
 }
 
+fn disk_rows(host: &Host, disk: &Disk, mounts: &[Mount]) -> Vec<Row> {
+    let path = &disk.path;
+    let mut rows = vec![
+        Row::header(format!("{}  ·  {}", disk.name, disk.media.label())),
+        Row::field("Capacity", human_bytes(disk.size)),
+        Row::field(
+            "Model",
+            read(path.join("device/model"))
+                .or_else(|| read(path.join("device/name")))
+                .unwrap_or_else(|| "unknown".into()),
+        ),
+    ];
+    if let Some(wwid) = read(path.join("device/wwid")) {
+        rows.push(Row::identifier("World-wide id", wwid));
+    }
+    if let Some(sector) = read(path.join("queue/logical_block_size")) {
+        rows.push(Row::field("Sector size", format!("{sector} B")));
+    }
+    if let Some(scheduler) = read(path.join("queue/scheduler")) {
+        rows.push(Row::field("Scheduler", scheduler));
+    }
+    rows.push(Row::field(
+        "Removable",
+        yes_no(read(path.join("removable")).as_deref()),
+    ));
+
+    // An unpartitioned disk can carry a filesystem (or a LUKS container) of
+    // its own, and is then its own only "partition".
+    let volumes: Vec<Volume<'_>> = if disk.partitions.is_empty() {
+        vec![Volume {
+            name: &disk.name,
+            path: &disk.path,
+            size: disk.size,
+            indent: false,
+        }]
+    } else {
+        disk.partitions
+            .iter()
+            .map(|p| Volume {
+                name: &p.name,
+                path: &p.path,
+                size: p.size,
+                indent: true,
+            })
+            .collect()
+    };
+
+    for volume in volumes {
+        rows.extend(volume_rows(host, &volume, mounts));
+    }
+
+    rows
+}
+
+/// A partition, or a whole disk used without a partition table.
+struct Volume<'a> {
+    name: &'a str,
+    path: &'a Path,
+    size: u64,
+    indent: bool,
+}
+
+/// One line for the volume, then a usage gauge for each filesystem it
+/// carries (directly, or through LUKS/LVM).
+fn volume_rows(host: &Host, volume: &Volume<'_>, mounts: &[Mount]) -> Vec<Row> {
+    let stack = holder_stack(host, volume.name, volume.path);
+    let top = stack
+        .last()
+        .map_or(volume.name, |layer| layer.name.as_str());
+    let mounted: Vec<&Mount> = mounts
+        .iter()
+        .filter(|m| m.device.as_deref() == Some(top))
+        .collect();
+
+    let mut detail = vec![human_bytes(volume.size)];
+    for layer in &stack {
+        detail.push(format!("→ {}", layer.describe()));
+    }
+    match mounted.first() {
+        Some(first) => {
+            let mut points: Vec<&str> = mounted.iter().map(|m| m.point.as_str()).collect();
+            points.sort_unstable();
+            detail.push(first.fstype.clone());
+            detail.push(points.join(", "));
+        }
+        None => detail.push("not mounted".into()),
+    }
+
+    let label = if volume.indent {
+        format!("  {}", volume.name)
+    } else {
+        volume.name.to_string()
+    };
+    let mut rows = vec![Row::field(label, detail.join("  "))];
+
+    // Every subvolume of one btrfs reports the same usage, so one gauge per
+    // filesystem, taken from its first mount point.
+    if let Some(first) = mounted.first()
+        && let Some(usage) = fs_usage(&host.path(&first.point))
+    {
+        rows.push(usage_row(usage));
+    }
+
+    rows
+}
+
+fn usage_row(usage: FsUsage) -> Row {
+    Row::field_with(
+        "    used",
+        format!(
+            "{} used, {} free, {}%",
+            human_bytes(usage.used),
+            human_bytes(usage.avail),
+            round_u64(usage.fraction() * 100.0)
+        ),
+        usage.fraction(),
+    )
+}
+
+/// A device-mapper node stacked on a partition.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Layer {
+    /// Kernel name, `dm-0`.
+    name: String,
+    /// The mapper name, `root` for `/dev/mapper/root`.
+    mapper: Option<String>,
+    kind: LayerKind,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LayerKind {
+    Luks,
+    Lvm,
+    Other,
+}
+
+impl Layer {
+    fn read(host: &Host, name: &str) -> Layer {
+        let dm = host.path(format!("/sys/class/block/{name}/dm"));
+        // The dm uuid names the target that created the node:
+        // CRYPT-LUKS2-..., LVM-..., and so on.
+        let uuid = read(dm.join("uuid")).unwrap_or_default();
+        let kind = if uuid.starts_with("CRYPT-") {
+            LayerKind::Luks
+        } else if uuid.starts_with("LVM-") {
+            LayerKind::Lvm
+        } else {
+            LayerKind::Other
+        };
+
+        Layer {
+            name: name.to_string(),
+            mapper: read(dm.join("name")),
+            kind,
+        }
+    }
+
+    fn describe(&self) -> String {
+        let kind = match self.kind {
+            LayerKind::Luks => Some("LUKS"),
+            LayerKind::Lvm => Some("LVM"),
+            LayerKind::Other => None,
+        };
+
+        match (&self.mapper, kind) {
+            (Some(mapper), Some(kind)) => format!("{} ({mapper}, {kind})", self.name),
+            (Some(mapper), None) => format!("{} ({mapper})", self.name),
+            (None, Some(kind)) => format!("{} ({kind})", self.name),
+            (None, None) => self.name.clone(),
+        }
+    }
+}
+
+/// The device-mapper layers stacked on a volume, bottom first, following the
+/// first holder at each level. A partition with nothing on top is empty.
+fn holder_stack(host: &Host, name: &str, path: &Path) -> Vec<Layer> {
+    let mut stack = Vec::new();
+    let mut holders = path.join("holders");
+    let mut seen = vec![name.to_string()];
+
+    while stack.len() < MAX_HOLDER_DEPTH {
+        let Some(next) = list_dir(&holders).first().map(|p| file_name(p)) else {
+            break;
+        };
+        if seen.contains(&next) {
+            break;
+        }
+
+        holders = host.path(format!("/sys/class/block/{next}/holders"));
+        seen.push(next.clone());
+        stack.push(Layer::read(host, &next));
+    }
+
+    stack
+}
+
+/// Walk the other way, from a mounted device down to the partition under it,
+/// for the "Root filesystem on" summary: `dm-0 (root, LUKS) on nvme0n1p2`.
+fn describe_root(host: &Host, root: &Mount) -> String {
+    let Some(device) = root.device.as_deref() else {
+        return root.source.clone();
+    };
+
+    let mut chain = vec![device.to_string()];
+    let mut current = device.to_string();
+    for _ in 0..MAX_HOLDER_DEPTH {
+        let slaves = host.list_dir(format!("/sys/class/block/{current}/slaves"));
+        let Some(below) = slaves.first().map(|p| file_name(p)) else {
+            break;
+        };
+        chain.push(below.clone());
+        current = below;
+    }
+
+    let top = if device.starts_with("dm-") {
+        Layer::read(host, device).describe()
+    } else {
+        device.to_string()
+    };
+
+    match chain.last() {
+        Some(bottom) if chain.len() > 1 => format!("{top} on {bottom}"),
+        _ => top,
+    }
+}
+
+fn sectors_to_bytes(sectors: u64) -> u64 {
+    // The kernel counts `size` in 512-byte units whatever the real sector
+    // size. Saturating: a nonsense value must not wrap a huge disk into a
+    // tiny one, or panic in a debug build.
+    sectors.saturating_mul(512)
+}
+
+fn yes_no(flag: Option<&str>) -> &str {
+    match flag {
+        Some("0") => "no",
+        Some("1") => "yes",
+        Some(other) => other,
+        None => "-",
+    }
+}
+
+/// One line of `/proc/mounts`, already filtered to block-backed filesystems.
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct Mount {
-    dev: String,
-    /// Basename of the mount source, and of its canonical path when that differs.
-    /// Resolved once, so matching a disk does not `canonicalize` per comparison.
-    names: [String; 2],
-    fstype: String,
+    source: String,
     point: String,
+    fstype: String,
+    /// The kernel block device behind `source` (`dm-0` for
+    /// `/dev/mapper/root`), resolved once here rather than per comparison.
+    device: Option<String>,
 }
 
-impl Mount {
-    fn matches(&self, name: &str) -> bool {
-        self.names.iter().any(|n| name_matches(n, name))
-    }
-}
-
-fn mount_table() -> Vec<Mount> {
-    let Some(content) = read("/proc/mounts") else {
+fn mount_table(host: &Host) -> Vec<Mount> {
+    let Some(content) = host.read("/proc/mounts") else {
         return Vec::new();
     };
+
     parse_mounts(&content)
         .into_iter()
-        .map(|(dev, fstype, point)| {
-            let direct = file_name(&dev);
-            let resolved = std::fs::canonicalize(&dev)
+        .map(|mut mount| {
+            mount.device = std::fs::canonicalize(host.path(&mount.source))
                 .ok()
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| direct.clone());
-            Mount {
-                dev,
-                names: [direct, resolved],
-                fstype,
-                point,
-            }
+                .map(|p| file_name(&p));
+            mount
         })
         .collect()
 }
 
-fn file_name(path: &str) -> String {
-    Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string())
-}
-
-fn parse_mounts(content: &str) -> Vec<(String, String, String)> {
+fn parse_mounts(content: &str) -> Vec<Mount> {
     content
         .lines()
         .filter_map(|l| {
             let mut parts = l.split_whitespace();
-            let dev = parts.next()?.to_string();
-            let point = parts.next()?.to_string();
+            let source = unescape(parts.next()?);
+            let point = unescape(parts.next()?);
             let fstype = parts.next()?.to_string();
-            Some((unescape(&dev), fstype, unescape(&point)))
+
+            Some(Mount {
+                source,
+                point,
+                fstype,
+                device: None,
+            })
         })
-        .filter(|(dev, fs, _)| {
-            dev.starts_with("/dev/") || matches!(fs.as_str(), "zfs" | "btrfs" | "overlay")
-        })
+        .filter(|m| m.source.starts_with("/dev/"))
         .collect()
 }
 
@@ -234,196 +429,103 @@ fn unescape(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
+
     while i < bytes.len() {
-        if bytes[i] == b'\\' && i + 3 < bytes.len() {
-            let digits = &bytes[i + 1..i + 4];
-            if digits.iter().all(|c| (b'0'..=b'7').contains(c)) {
-                if let Ok(byte) = u8::from_str_radix(std::str::from_utf8(digits).unwrap_or(""), 8) {
-                    // The kernel escapes each byte of a multi-byte UTF-8 sequence.
-                    out.push(byte);
-                    i += 4;
-                    continue;
-                }
-            }
+        if bytes[i] == b'\\'
+            && let Some(byte) = bytes.get(i + 1..i + 4).and_then(octal_byte)
+        {
+            // The kernel escapes each byte of a multi-byte UTF-8 sequence.
+            out.push(byte);
+            i += 4;
+            continue;
         }
         out.push(bytes[i]);
         i += 1;
     }
+
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn disk_usage(table: &[Usage], device: &str) -> Option<(String, String, f64)> {
-    let want = file_name(device);
-    if let Some(row) = table
-        .iter()
-        .find(|u| u.source == device || file_name(&u.source) == want)
-    {
-        return Some((row.used.clone(), row.avail.clone(), row.pct));
+/// Three octal digits as one byte, or `None` if they are not that.
+fn octal_byte(digits: &[u8]) -> Option<u8> {
+    let mut value: u16 = 0;
+    for digit in digits {
+        if !(b'0'..=b'7').contains(digit) {
+            return None;
+        }
+        value = value * 8 + u16::from(digit - b'0');
     }
-    df_device(device)
+
+    u8::try_from(value).ok()
 }
 
-struct Usage {
-    source: String,
-    used: String,
-    avail: String,
-    pct: f64,
+/// `label root, 1 device(s)` for the btrfs filesystem on `device`, read from
+/// `/sys/fs/btrfs` rather than by running `btrfs filesystem show`, which
+/// needs root to scan devices and used to fork on every refresh.
+fn btrfs_summary(host: &Host, device: &str) -> Option<String> {
+    host.list_dir("/sys/fs/btrfs").into_iter().find_map(|fs| {
+        let devices: Vec<String> = list_dir(fs.join("devices"))
+            .iter()
+            .map(|p| file_name(p))
+            .collect();
+        if !devices.iter().any(|d| d == device) {
+            return None;
+        }
+        let label = read(fs.join("label")).unwrap_or_else(|| "<none>".into());
+
+        Some(format!("label {label}, {} device(s)", devices.len()))
+    })
 }
 
-/// One `df` for every filesystem. A per-device call forks once per disk.
-fn usage_table() -> Vec<Usage> {
-    let Ok(out) = std::process::Command::new("df")
-        .args(["-B1", "--output=source,size,used,avail,pcent"])
-        .output()
-    else {
-        return Vec::new();
+/// Whether the systemd timer that trims SSDs weekly is enabled. There is no
+/// kernel switch for this; the old `/sys/module/fstrim` path does not exist.
+fn fstrim_state(host: &Host) -> &'static str {
+    let wants = "timers.target.wants/fstrim.timer";
+    // The enablement is the symlink itself; whether its target resolves from
+    // here is beside the point.
+    let linked = |dir: &str| {
+        host.path(format!("{dir}/{wants}"))
+            .symlink_metadata()
+            .is_ok()
     };
-    let Ok(text) = String::from_utf8(out.stdout) else {
-        return Vec::new();
-    };
-    parse_df_table(&text)
-}
 
-fn parse_df_table(text: &str) -> Vec<Usage> {
-    text.lines()
-        .skip(1)
-        .filter_map(|line| {
-            let mut parts = line.split_whitespace();
-            let source = parts.next()?.to_string();
-            let _size = parts.next()?;
-            let used = parts.next()?.parse().ok()?;
-            let avail = parts.next()?.parse().ok()?;
-            let pct = parts.next()?.trim_end_matches('%').parse().ok()?;
-            Some(Usage {
-                source,
-                used: human_bytes(used),
-                avail: human_bytes(avail),
-                pct,
-            })
-        })
-        .collect()
-}
-
-/// Whether a mount source refers to `name` or to one of its partitions.
-///
-/// Partition naming is not uniform: SATA and USB disks append digits directly
-/// (`sda1`), while NVMe and mmc insert a `p` (`nvme0n1p1`, `mmcblk0p1`). Only
-/// recognising the `p` form meant a mounted `/dev/sda1` was reported as an
-/// unmounted `sda`.
-fn name_matches(base: &str, name: &str) -> bool {
-    if base == name {
-        return true;
+    if linked("/etc/systemd/system") || linked("/usr/lib/systemd/system") {
+        "fstrim.timer enabled"
+    } else {
+        "fstrim.timer not enabled"
     }
-    let Some(rest) = base.strip_prefix(name) else {
-        return false;
-    };
-    let digits = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
-    digits(rest) || rest.strip_prefix('p').is_some_and(digits)
-}
-
-fn df_device(device: &str) -> Option<(String, String, f64)> {
-    let out = std::process::Command::new("df")
-        .args(["-B1", "--output=size,used,avail,pcent", device])
-        .output()
-        .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    parse_df(&text)
-}
-
-/// `df` puts a device whose name wraps onto a line of its own, so the figures
-/// are the last non-empty row rather than the second.
-fn parse_df(text: &str) -> Option<(String, String, f64)> {
-    let last = text
-        .lines()
-        .skip(1)
-        .filter(|l| !l.trim().is_empty())
-        .last()?;
-    let mut parts = last.split_whitespace();
-    let _size = parts.next()?;
-    let used = parts.next()?;
-    let avail = parts.next()?;
-    let pcent = parts.next()?.trim_end_matches('%');
-    Some((
-        human_bytes(used.parse().ok()?),
-        human_bytes(avail.parse().ok()?),
-        pcent.parse().ok()?,
-    ))
-}
-
-fn root_disk() -> Option<String> {
-    let dev = std::fs::read_link("/dev/root").ok()?;
-    Some(dev.to_string_lossy().to_string())
-}
-
-fn btrfs_summary() -> Option<String> {
-    let out = std::process::Command::new("btrfs")
-        .args(["filesystem", "show", "/"])
-        .output()
-        .ok()?;
-    let text = String::from_utf8(out.stdout).ok()?;
-    parse_btrfs(&text)
-}
-
-fn parse_btrfs(text: &str) -> Option<String> {
-    let label = text.lines().find(|l| l.contains("Label:")).map(|l| {
-        l.split("Label:")
-            .nth(1)
-            .unwrap_or("")
-            .split("uuid:")
-            .next()
-            .unwrap_or("")
-            .trim()
-            // btrfs prints the label in single quotes; keeping them made
-            // the summary read `label "'root'"`.
-            .trim_matches('\'')
-            .to_string()
-    })?;
-    let devices = text
-        .lines()
-        .filter(|l| l.trim_start().starts_with("devid") || l.contains(" path /dev/"))
-        .count();
-    let shown = if label == "none" { "<none>" } else { &label };
-    Some(format!("label {shown}, {devices} device(s)"))
-}
-
-fn smart_summary(block: &Path) -> Option<String> {
-    if !block.join("device").exists() {
-        return None;
-    }
-    if let Some(health) = read(block.join("device/health")) {
-        return Some(format!("health {}", health.trim_end_matches('\n')));
-    }
-    let power = read_u64(block.join("device/power_state"))?;
-    Some(format!("power state {power}"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::fixture::Fixture;
 
-    // ---- dash_opt --------------------------------------------------------
-
-    #[test]
-    fn dash_opt_spells_out_the_boolean() {
-        assert_eq!(dash_opt(Some("0".into())), "no");
-        assert_eq!(dash_opt(Some("1".into())), "yes");
-        assert_eq!(dash_opt(Some("other".into())), "other");
-        assert_eq!(dash_opt(None), "-");
+    fn text(rows: &[Row]) -> String {
+        format!("{rows:?}")
     }
 
-    // ---- sectors_to_bytes ------------------------------------------------
+    // ---- small helpers -----------------------------------------------------
+
+    #[test]
+    fn yes_no_spells_out_the_boolean() {
+        assert_eq!(yes_no(Some("0")), "no");
+        assert_eq!(yes_no(Some("1")), "yes");
+        assert_eq!(yes_no(Some("other")), "other");
+        assert_eq!(yes_no(None), "-");
+    }
 
     #[test]
     fn sectors_convert_at_512_bytes() {
-        assert_eq!(0u64.sectors_to_bytes(), 0);
-        assert_eq!(1u64.sectors_to_bytes(), 512);
-        assert_eq!(2048u64.sectors_to_bytes(), 1_048_576);
+        assert_eq!(sectors_to_bytes(0), 0);
+        assert_eq!(sectors_to_bytes(1), 512);
+        assert_eq!(sectors_to_bytes(2048), 1_048_576);
     }
 
     #[test]
     fn sector_conversion_saturates_instead_of_wrapping() {
         // A wrapped multiplication would report a huge disk as a tiny one.
-        assert_eq!(u64::MAX.sectors_to_bytes(), u64::MAX);
+        assert_eq!(sectors_to_bytes(u64::MAX), u64::MAX);
     }
 
     // ---- unescape -------------------------------------------------------
@@ -436,6 +538,8 @@ mod tests {
         assert_eq!(unescape("/mnt/back\\134slash"), "/mnt/back\\slash");
         // é is the two bytes c3 a9. Pushing each as a char produced "Ã©".
         assert_eq!(unescape("/mnt/caf\\303\\251"), "/mnt/café");
+        // An escape at the very end is still an escape.
+        assert_eq!(unescape("/mnt/end\\040"), "/mnt/end ");
     }
 
     #[test]
@@ -452,42 +556,7 @@ mod tests {
         assert_eq!(unescape("/a\\999"), "/a\\999", "9 is not an octal digit");
         assert_eq!(unescape("/a\\"), "/a\\", "a trailing backslash");
         assert_eq!(unescape("/a\\04"), "/a\\04", "too few digits");
-    }
-
-    // ---- name_matches ----------------------------------------------------
-
-    #[test]
-    fn a_disk_matches_its_own_name() {
-        assert!(name_matches("sda", "sda"));
-        assert!(name_matches("nvme0n1", "nvme0n1"));
-    }
-
-    #[test]
-    fn a_disk_matches_its_partitions_in_both_naming_styles() {
-        // The bug: only the "p" form was recognised, so a mounted /dev/sda1
-        // left the sda disk looking unmounted.
-        assert!(name_matches("sda1", "sda"), "SATA/USB digit suffix");
-        assert!(name_matches("sda12", "sda"));
-        assert!(name_matches("nvme0n1p1", "nvme0n1"), "NVMe p suffix");
-        assert!(name_matches("nvme0n1p12", "nvme0n1"));
-        assert!(name_matches("mmcblk0p1", "mmcblk0"), "mmc p suffix");
-    }
-
-    #[test]
-    fn a_disk_does_not_match_a_different_disk() {
-        assert!(!name_matches("sdb", "sda"));
-        assert!(!name_matches("nvme0n2", "nvme0n1"));
-        // A shared prefix that is not a partition number.
-        assert!(!name_matches("sdaa", "sda"));
-        assert!(!name_matches("sdaX1", "sda"));
-        assert!(!name_matches("nvme0n1xp1", "nvme0n1"));
-    }
-
-    #[test]
-    fn a_bare_name_is_not_treated_as_a_partition() {
-        // "p" with no digits after it is a different device.
-        assert!(!name_matches("sda p", "sda"));
-        assert!(!name_matches("nvme0n1p", "nvme0n1"));
+        assert_eq!(unescape("/a\\777"), "/a\\777", "does not fit in a byte");
     }
 
     // ---- parse_mounts ----------------------------------------------------
@@ -502,17 +571,11 @@ overlay /var/lib/docker overlay rw 0 0
 ";
 
     #[test]
-    fn parse_mounts_keeps_only_real_filesystems() {
+    fn parse_mounts_keeps_only_block_backed_filesystems() {
         let mounts = parse_mounts(MOUNTS);
-        let devices: Vec<&str> = mounts.iter().map(|(d, _, _)| d.as_str()).collect();
-        assert!(devices.contains(&"/dev/nvme0n1p2"));
-        assert!(devices.contains(&"/dev/mapper/root"), "btrfs root kept");
-        assert!(devices.contains(&"overlay"), "overlay kept by fstype");
-        assert!(!devices.contains(&"/run"), "tmpfs dropped");
-        assert!(
-            !devices.iter().any(|d| d.starts_with("proc")),
-            "proc dropped"
-        );
+        let sources: Vec<&str> = mounts.iter().map(|m| m.source.as_str()).collect();
+
+        assert_eq!(sources, ["/dev/nvme0n1p2", "/dev/mapper/root", "/dev/sda1"]);
     }
 
     #[test]
@@ -520,17 +583,19 @@ overlay /var/lib/docker overlay rw 0 0
         let mounts = parse_mounts(MOUNTS);
         let disk = mounts
             .iter()
-            .find(|(d, _, _)| d == "/dev/sda1")
+            .find(|m| m.source == "/dev/sda1")
             .expect("sda1 present");
-        assert_eq!(disk.1, "vfat");
-        assert_eq!(disk.2, "/mnt/my disk", "the escaped space is decoded");
+
+        assert_eq!(disk.fstype, "vfat");
+        assert_eq!(disk.point, "/mnt/my disk", "the escaped space is decoded");
     }
 
     #[test]
     fn parse_mounts_skips_lines_with_too_few_columns() {
         let mounts = parse_mounts("/dev/sda1\n/dev/sdb1 /mnt ext4\n");
+
         assert_eq!(mounts.len(), 1);
-        assert_eq!(mounts[0].2, "/mnt");
+        assert_eq!(mounts[0].point, "/mnt");
     }
 
     #[test]
@@ -538,70 +603,173 @@ overlay /var/lib/docker overlay rw 0 0
         assert!(parse_mounts("").is_empty());
     }
 
-    // ---- parse_df --------------------------------------------------------
+    // ---- an Omarchy install: LUKS + btrfs on NVMe ----------------------------
 
-    #[test]
-    fn parse_df_reads_used_available_and_percentage() {
-        let out = "  Size   Used  Avail Use%\n1073741824 536870912 536870912  50%\n";
-        let (used, avail, pct) = parse_df(out).expect("parsed");
-        assert_eq!(used, "512.0 MiB");
-        assert_eq!(avail, "512.0 MiB");
-        assert_eq!(pct, 50.0);
-    }
+    /// The default Omarchy layout: an EFI partition mounted at /boot, and the
+    /// rest of the disk a LUKS container named `root` holding a btrfs with
+    /// several subvolumes.
+    fn omarchy_install() -> Fixture {
+        let fx = Fixture::new();
+        let disk = "sys/block/nvme0n1";
+        fx.write(&format!("{disk}/size"), "2000409264\n");
+        fx.write(&format!("{disk}/queue/rotational"), "0\n");
+        fx.write(&format!("{disk}/device/model"), "Samsung SSD 990 PRO 1TB\n");
+        fx.write(&format!("{disk}/removable"), "0\n");
+        fx.write(&format!("{disk}/nvme0n1p1/partition"), "1\n");
+        fx.write(&format!("{disk}/nvme0n1p1/size"), "4194304\n");
+        fx.mkdir(&format!("{disk}/nvme0n1p1/holders"));
+        fx.write(&format!("{disk}/nvme0n1p2/partition"), "2\n");
+        fx.write(&format!("{disk}/nvme0n1p2/size"), "1996212224\n");
+        fx.mkdir(&format!("{disk}/nvme0n1p2/holders/dm-0"));
 
-    #[test]
-    fn parse_df_takes_the_last_row_when_df_wraps_a_long_device_name() {
-        // df prints a device whose name is too long onto its own line, leaving
-        // the figures on the following row.
-        let out = "  Size   Used  Avail Use%\n\
-                   /dev/mapper/a-really-long-volume-group-name\n\
-                   1073741824 268435456 805306368  25%\n";
-        let (_, _, pct) = parse_df(out).expect("parsed");
-        assert_eq!(pct, 25.0);
-    }
-
-    #[test]
-    fn parse_df_rejects_incomplete_output() {
-        assert!(parse_df("").is_none());
-        assert!(parse_df("  Size   Used  Avail Use%\n").is_none());
-        assert!(
-            parse_df("header\n1 2 3\n").is_none(),
-            "missing the percentage"
+        // dm-0 appears under /sys/block too, and must not become a disk.
+        fx.write("sys/block/dm-0/size", "1996179456\n");
+        fx.write("sys/class/block/dm-0/dm/name", "root\n");
+        fx.write(
+            "sys/class/block/dm-0/dm/uuid",
+            "CRYPT-LUKS2-0123456789abcdef-root\n",
         );
-        assert!(
-            parse_df("header\n1 2 3 x%\n").is_none(),
-            "percentage not a number"
+        fx.mkdir("sys/class/block/dm-0/holders");
+        fx.mkdir("sys/class/block/dm-0/slaves/nvme0n1p2");
+
+        fx.write("dev/nvme0n1p1", "");
+        fx.write("dev/dm-0", "");
+        fx.symlink("dev/mapper/root", "../dm-0");
+        fx.write(
+            "proc/mounts",
+            "/dev/mapper/root / btrfs rw,subvol=/@ 0 0\n\
+             /dev/mapper/root /home btrfs rw,subvol=/@home 0 0\n\
+             /dev/nvme0n1p1 /boot vfat rw 0 0\n\
+             tmpfs /tmp tmpfs rw 0 0\n",
         );
-    }
 
-    // ---- parse_btrfs -----------------------------------------------------
-
-    #[test]
-    fn parse_btrfs_reads_the_label_and_device_count() {
-        let out = "\
-Label: 'myroot'  uuid: 1234abcd
-Data profile: single
-Devices:
-   ID    gen    top level  path
-   1     20     5           path /dev/sda2
-devid    1 size 1.0 GiB used 0.00 B
-";
-        let s = parse_btrfs(out).expect("parsed");
-        assert!(s.contains("myroot"), "{s}");
-        assert!(!s.contains('\''), "quotes must not be doubled: {s}");
-        assert!(s.contains("2 device(s)"), "{s}");
+        fx.write("sys/fs/btrfs/1234-abcd/label", "omarchy\n");
+        fx.mkdir("sys/fs/btrfs/1234-abcd/devices/dm-0");
+        fx.symlink(
+            "etc/systemd/system/timers.target.wants/fstrim.timer",
+            "/usr/lib/systemd/system/fstrim.timer",
+        );
+        fx
     }
 
     #[test]
-    fn parse_btrfs_labels_an_unnamed_filesystem() {
-        let out = "Label: 'none'  uuid: 1234\ndevid    1 size 1 GiB\n";
-        let s = parse_btrfs(out).expect("parsed");
-        assert!(s.contains("<none>"), "{s}");
+    fn a_luks_root_is_credited_to_the_partition_under_it() {
+        let fx = omarchy_install();
+        let rows = rows(&fx.host());
+        let text = text(&rows);
+
+        let p2 = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Field { label, value, .. } if label == "  nvme0n1p2" => {
+                    Some(value.to_string())
+                }
+                _ => None,
+            })
+            .expect("a row for nvme0n1p2");
+        assert!(p2.contains("dm-0 (root, LUKS)"), "{p2}");
+        assert!(p2.contains("btrfs"), "{p2}");
+        assert!(p2.contains("/, /home"), "{p2}");
+
+        let p1 = rows
+            .iter()
+            .find_map(|r| match r {
+                Row::Field { label, value, .. } if label == "  nvme0n1p1" => {
+                    Some(value.to_string())
+                }
+                _ => None,
+            })
+            .expect("a row for nvme0n1p1");
+        assert!(p1.contains("vfat  /boot"), "{p1}");
+
+        assert!(!text.contains("dm-0  ·"), "dm-0 is not a disk: {text}");
     }
 
     #[test]
-    fn parse_btrfs_needs_a_label_line() {
-        assert!(parse_btrfs("").is_none());
-        assert!(parse_btrfs("devid 1 size 1 GiB\n").is_none());
+    fn the_totals_describe_the_root_stack_and_btrfs() {
+        let fx = omarchy_install();
+        let text = text(&rows(&fx.host()));
+
+        assert!(text.contains("\"1\""), "one block device: {text}");
+        assert!(text.contains("dm-0 (root, LUKS) on nvme0n1p2"), "{text}");
+        assert!(text.contains("label omarchy, 1 device(s)"), "{text}");
+        assert!(text.contains("fstrim.timer enabled"), "{text}");
+    }
+
+    #[test]
+    fn the_disk_header_names_the_media() {
+        let fx = omarchy_install();
+
+        assert!(text(&rows(&fx.host())).contains("nvme0n1  ·  SSD / NVMe"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_mounted_filesystem_gets_a_usage_gauge() {
+        // statvfs on the fixture's own directory stands in for the real
+        // filesystem; all that matters is that the gauge row appears.
+        let fx = omarchy_install();
+        let rows = rows(&fx.host());
+
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            Row::Field { label, bar: Some(_), .. } if label == "    used"
+        )));
+    }
+
+    #[test]
+    fn an_unpartitioned_disk_is_its_own_volume() {
+        let fx = Fixture::new();
+        fx.write("sys/block/sdb/size", "2048\n");
+        fx.write("sys/block/sdb/queue/rotational", "1\n");
+        fx.write("dev/sdb", "");
+        fx.write("proc/mounts", "/dev/sdb /mnt/backup ext4 rw 0 0\n");
+        let text = text(&rows(&fx.host()));
+
+        assert!(text.contains("sdb  ·  HDD"), "{text}");
+        assert!(text.contains("ext4  /mnt/backup"), "{text}");
+    }
+
+    #[test]
+    fn loop_and_zero_sized_devices_are_skipped() {
+        let fx = Fixture::new();
+        fx.write("sys/block/loop0/size", "2048\n");
+        fx.write("sys/block/sdc/size", "0\n");
+
+        assert_eq!(rows(&fx.host()), [Row::note("no block devices")]);
+    }
+
+    #[test]
+    fn zram_is_a_ram_disk_not_an_ssd() {
+        let fx = Fixture::new();
+        fx.write("sys/block/zram0/size", "8388608\n");
+
+        assert!(text(&rows(&fx.host())).contains("zram0  ·  RAM disk"));
+    }
+
+    #[test]
+    fn a_holder_cycle_does_not_loop_forever() {
+        let fx = Fixture::new();
+        fx.mkdir("sys/block/sda/sda1/holders/dm-0");
+        fx.mkdir("sys/class/block/dm-0/holders/dm-1");
+        fx.mkdir("sys/class/block/dm-1/holders/dm-0");
+        let host = fx.host();
+
+        let stack = holder_stack(&host, "sda1", &host.path("/sys/block/sda/sda1"));
+        assert_eq!(stack.len(), 2);
+    }
+
+    #[test]
+    fn btrfs_summary_is_none_for_a_device_it_does_not_hold() {
+        let fx = omarchy_install();
+
+        assert_eq!(btrfs_summary(&fx.host(), "sda1"), None);
+    }
+
+    #[test]
+    fn usage_row_carries_df_style_figures() {
+        let row = usage_row(FsUsage::from_blocks(4096, 100, 40, 30));
+
+        assert!(format!("{row:?}").contains("67%"), "{row:?}");
     }
 }
