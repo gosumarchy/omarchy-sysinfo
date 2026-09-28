@@ -1,26 +1,56 @@
-use super::{Row, fs::read, units::dash};
+//! The PCI bus, and the `pci.ids` database that names what is on it.
+
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::OnceLock;
 
-/// Resolve `0x8086:0x9a49` into `Intel Corporation Meteor Lake-P [Intel Arc Graphics]`
-/// using the system `pci.ids` database when one is installed.
-pub(crate) fn device_name(vendor: &str, device: &str) -> Option<String> {
-    let vendor_id = parse_hex_id(vendor)?;
-    let device_id = parse_hex_id(device)?;
-    let db = ids();
-    let device_name = db.devices.get(&(vendor_id, device_id))?;
-    let vendor_name = db
-        .vendors
-        .get(&vendor_id)
-        .map(String::as_str)
-        .unwrap_or("Unknown vendor");
-    Some(format!("{vendor_name} {device_name}"))
+use super::fs::{driver_name, file_name, read};
+use super::units::dash;
+use super::{Host, Row};
+
+/// Vendor and device names from the system `pci.ids`.
+///
+/// Loaded once per process: the file is over a megabyte and never changes
+/// while we run.
+#[derive(Debug, Default)]
+pub(crate) struct Ids {
+    vendors: HashMap<u16, String>,
+    devices: HashMap<(u16, u16), String>,
 }
 
-pub(crate) fn vendor_name(vendor: &str) -> Option<String> {
-    let id = parse_hex_id(vendor)?;
-    ids().vendors.get(&id).cloned()
+impl Ids {
+    pub(crate) fn load(host: &Host) -> Ids {
+        ["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"]
+            .into_iter()
+            .filter_map(|path| std::fs::read_to_string(host.path(path)).ok())
+            .map(|text| parse_ids(&text))
+            .find(|ids| !ids.vendors.is_empty())
+            .unwrap_or_default()
+    }
+
+    /// Resolve `0x8086:0x9a49` into `Intel Corporation Meteor Lake-P [Intel Arc
+    /// Graphics]`.
+    pub(crate) fn device_name(&self, vendor: &str, device: &str) -> Option<String> {
+        let vendor_id = parse_hex_id(vendor)?;
+        let device_id = parse_hex_id(device)?;
+        let device_name = self.devices.get(&(vendor_id, device_id))?;
+        let vendor_name = self
+            .vendors
+            .get(&vendor_id)
+            .map_or("Unknown vendor", String::as_str);
+
+        Some(format!("{vendor_name} {device_name}"))
+    }
+
+    pub(crate) fn vendor_name(&self, vendor: &str) -> Option<String> {
+        self.vendors.get(&parse_hex_id(vendor)?).cloned()
+    }
+
+    /// The best name available: the device, else its vendor, else `fallback`.
+    pub(crate) fn describe(&self, vendor: &str, device: &str, fallback: &str) -> String {
+        self.device_name(vendor, device)
+            .or_else(|| self.vendor_name(vendor))
+            .unwrap_or_else(|| fallback.to_string())
+    }
 }
 
 /// A PCI id as sysfs writes it, `0x8086`, with either case of the prefix.
@@ -30,169 +60,144 @@ fn parse_hex_id(s: &str) -> Option<u16> {
         .strip_prefix("0x")
         .or_else(|| s.strip_prefix("0X"))
         .unwrap_or(s);
+
     u16::from_str_radix(s, 16).ok()
-}
-
-struct Ids {
-    vendors: HashMap<u16, String>,
-    devices: HashMap<(u16, u16), String>,
-}
-
-fn ids() -> &'static Ids {
-    static IDS: OnceLock<Ids> = OnceLock::new();
-    IDS.get_or_init(|| {
-        for path in ["/usr/share/hwdata/pci.ids", "/usr/share/misc/pci.ids"] {
-            if !Path::new(path).exists() {
-                continue;
-            }
-            let Ok(text) = std::fs::read_to_string(path) else {
-                continue;
-            };
-            let parsed = parse_ids(&text);
-            if !parsed.vendors.is_empty() {
-                return parsed;
-            }
-        }
-        Ids {
-            vendors: HashMap::new(),
-            devices: HashMap::new(),
-        }
-    })
 }
 
 /// Parse a `pci.ids` database into vendors and devices.
 ///
-/// The file has three parts: vendors, their indented devices, and the device
-/// classes. A class heading such as `C 0c  Serial bus controller` is *not*
-/// indented and its first token, `C`, is a valid hex digit -- and it parses to
-/// 0x0c, not to the class number in the second token. The old parser therefore
-/// accepted every class heading as vendor 0x0c, letting the last one win, and
-/// filed the ~20 indented class names as devices of that bogus vendor. Only a
-/// four hex digit token can start a vendor line.
+/// The file has four kinds of line:
+///
+/// - `8086  Intel Corporation`: a vendor, at the left margin.
+/// - `\t9a49  Meteor Lake-P`: one of that vendor's devices, one tab in.
+/// - `\t\t1028 0b1d  Latitude`: a subsystem of that device, two tabs in. Its
+///   first token is the *subvendor* id, and reading it as a device id filed
+///   Dell's and Lenovo's subsystem names as devices of whatever vendor was
+///   current; the first-wins map then shadowed the real device of that id.
+/// - `C 0c  Serial bus controller`: a class heading, whose first token `C` is
+///   a valid hex digit. Only a four-hex-digit token can start a vendor line.
 fn parse_ids(text: &str) -> Ids {
-    let mut vendors = HashMap::new();
-    let mut devices = HashMap::new();
+    let mut ids = Ids::default();
     let mut current_vendor = None;
+
     for line in text.lines() {
-        if line.starts_with('#') || line.trim().is_empty() {
+        if line.starts_with('#') || line.trim().is_empty() || line.starts_with("\t\t") {
             continue;
         }
-        let indented = line.starts_with('\t');
-        if !indented {
-            let name = line.trim();
-            let Some(id) = name
-                .split_whitespace()
-                .next()
-                .filter(|tok| tok.len() == 4)
-                .and_then(|v| u16::from_str_radix(v, 16).ok())
-            else {
-                // A `C xx` class heading, or anything else that is not a
-                // vendor. It must not become the current vendor either, or
-                // the indented class names below it would be filed as
-                // devices of whatever vendor happened to be last.
-                current_vendor = None;
+
+        let (id, name) = split_id_line(line.trim());
+
+        if line.starts_with('\t') {
+            let (Some(vendor), Some(device)) = (current_vendor, id) else {
                 continue;
             };
-            let clean = name
-                .split_once(char::is_whitespace)
-                .map(|(_, rest)| rest)
-                .unwrap_or("")
-                .trim()
-                .to_string();
-            if clean.is_empty() {
-                // A bare id carries no information, and storing an empty name
-                // would render as " Meteor Lake-P" in the device row.
-                continue;
+            if !name.is_empty() {
+                ids.devices.entry((vendor, device)).or_insert(name);
             }
-            // First line wins, matching the device map below.
-            vendors.entry(id).or_insert(clean);
-            current_vendor = Some(id);
-        } else if let Some(vendor) = current_vendor {
-            // Device lines are `\t<id>  <name>`; the name can contain
-            // double spaces, so rejoin everything after the id.
-            let mut tokens = line.split_whitespace();
-            let Some(dev) = tokens.next() else {
-                continue;
-            };
-            if let Ok(dev_id) = u16::from_str_radix(dev, 16) {
-                let rest = line
-                    .trim()
-                    .split_once(char::is_whitespace)
-                    .map(|(_, rest)| rest)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if !rest.is_empty() {
-                    devices.entry((vendor, dev_id)).or_insert(rest);
-                }
+        } else {
+            // A `C xx` class heading, or anything else that is not a vendor,
+            // must not become the current vendor either, or the indented class
+            // names below it would be filed as its devices.
+            current_vendor = id;
+            if let Some(vendor) = id
+                && !name.is_empty()
+            {
+                // First line wins, matching the device map.
+                ids.vendors.entry(vendor).or_insert(name);
             }
         }
     }
-    Ids { vendors, devices }
+
+    ids
 }
 
-pub(crate) fn rows() -> Vec<Row> {
-    let devices = super::fs::list_dir("/sys/bus/pci/devices");
+/// `9a49  Meteor Lake-P [Intel Arc Graphics]` into its id and its name. The
+/// name can contain double spaces, so everything after the id is kept.
+fn split_id_line(line: &str) -> (Option<u16>, String) {
+    let (id, name) = line.split_once(char::is_whitespace).unwrap_or((line, ""));
+    let id = (id.len() == 4)
+        .then(|| u16::from_str_radix(id, 16).ok())
+        .flatten();
+
+    (id, name.trim().to_string())
+}
+
+/// One function on the bus, as sysfs describes it.
+#[derive(Clone, Debug, PartialEq)]
+struct PciDevice {
+    slot: String,
+    class: String,
+    vendor: String,
+    device: String,
+    driver: Option<String>,
+}
+
+impl PciDevice {
+    fn read(path: &Path) -> PciDevice {
+        PciDevice {
+            slot: file_name(path),
+            class: dash(read(path.join("class"))),
+            vendor: dash(read(path.join("vendor"))),
+            device: dash(read(path.join("device"))),
+            driver: driver_name(path.join("driver")),
+        }
+    }
+}
+
+pub(crate) fn rows(host: &Host, ids: &Ids) -> Vec<Row> {
+    // `list_dir` sorts, so the devices arrive in slot order.
+    let devices: Vec<PciDevice> = host
+        .list_dir("/sys/bus/pci/devices")
+        .iter()
+        .map(|path| PciDevice::read(path))
+        .collect();
     if devices.is_empty() {
         return vec![Row::note("no pci bus")];
     }
 
-    let mut rows = Vec::new();
-    let mut entries: Vec<(String, String, String, String, String, String)> = Vec::new();
+    devices
+        .into_iter()
+        .map(|d| {
+            let name = ids.describe(&d.vendor, &d.device, "unknown device");
 
-    for dev in devices {
-        let slot = dev
-            .file_name()
-            .map(|n| n.to_string_lossy().to_string())
-            .unwrap_or_default();
-        let class_id = dash(read(dev.join("class")));
-        let vendor = dash(read(dev.join("vendor")));
-        let device = dash(read(dev.join("device")));
-        let name = device_name(&vendor, &device)
-            .or_else(|| vendor_name(&vendor))
-            .unwrap_or_else(|| "unknown device".to_string());
-        let driver = super::fs::driver_name(dev.join("driver")).unwrap_or_else(|| "unbound".into());
-        entries.push((slot, class_id, vendor, device, name, driver));
-    }
-
-    entries.sort_by(|a, b| a.0.cmp(&b.0));
-
-    for (slot, class_id, vendor, device, name, driver) in entries {
-        rows.push(Row::field(
-            format!("{slot}  {driver}"),
-            format!("{name}  [{class_id} {vendor}:{device}]"),
-        ));
-    }
-    rows
+            Row::field(
+                format!("{}  {}", d.slot, d.driver.as_deref().unwrap_or("unbound")),
+                format!("{name}  [{} {}:{}]", d.class, d.vendor, d.device),
+            )
+        })
+        .collect()
 }
 
-/// Map a `/sys/class/drm/cardN` path back to its PCI slot, e.g. `0000:00:02.0`.
+/// Map a `/sys/class/drm/cardN/device` link to its PCI slot, e.g. `0000:03:00.0`.
 ///
-/// The domain is not assumed to be zero: a system can put a device behind
-/// another domain, and a hardcoded `0000:` prefix missed it.
+/// The canonical path walks down from the root complex through every bridge,
+/// `/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:02:00.0/0000:03:00.0`,
+/// so the device's own slot is the *last* slot-shaped component. Taking the
+/// first named the root port for every discrete GPU.
 pub(crate) fn pci_slot_of(path: &Path) -> Option<String> {
     let resolved = std::fs::canonicalize(path).ok()?;
+
     resolved
         .components()
         .filter_map(|c| {
-            let s = c.as_os_str().to_string_lossy().to_string();
-            looks_like_slot(&s).then_some(s)
+            let s = c.as_os_str().to_string_lossy();
+            looks_like_slot(&s).then(|| s.into_owned())
         })
-        .next()
+        .next_back()
 }
 
 /// `0000:00:02.0`: four hex digits, then bus and device, then a function.
 fn looks_like_slot(s: &str) -> bool {
     let mut parts = s.split(':');
-    let (Some(domain), Some(bus), Some(rest)) = (parts.next(), parts.next(), parts.next()) else {
+    let (Some(domain), Some(bus), Some(rest), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
         return false;
     };
-    if parts.next().is_some() {
-        return false;
-    }
     let Some((dev, func)) = rest.split_once('.') else {
         return false;
     };
+
     [domain, bus, dev, func]
         .iter()
         .all(|p| p.len() <= 4 && !p.is_empty() && p.chars().all(|c| c.is_ascii_hexdigit()))
@@ -201,6 +206,7 @@ fn looks_like_slot(s: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::fixture::Fixture;
 
     const PCI_IDS: &str = "\
 #
@@ -212,6 +218,9 @@ mod tests {
 15ad  VMware, Inc.
 \t07b0  SVGA II Adapter
 8086  Intel Corporation
+\t1000  82542 Gigabit Ethernet Controller (Fiber)
+\t\t1028 0002  PowerEdge Subsystem
+\t1028  RealDevice 1028
 \t9a49  Meteor Lake-P [Intel Arc Graphics]
 \t9a59  Lunar Lake-P [Intel Arc Graphics]
 
@@ -305,8 +314,20 @@ C 03  Display controller
             "{:?}",
             ids.devices
         );
-        // 2 AMD + 1 VMware + 2 Intel, plus the duplicate line's device.
-        assert_eq!(ids.devices.len(), 6, "{:?}", ids.devices);
+        // 2 AMD + 1 VMware + 4 Intel, plus the duplicate line's device.
+        assert_eq!(ids.devices.len(), 8, "{:?}", ids.devices);
+    }
+
+    #[test]
+    fn parse_ids_skips_subsystem_lines() {
+        // The subsystem line "\t\t1028 0002" came before the real device
+        // 8086:1028, and the first-wins map kept the subsystem's name.
+        let ids = parse_ids(PCI_IDS);
+        assert_eq!(
+            ids.devices.get(&(0x8086, 0x1028)).map(String::as_str),
+            Some("RealDevice 1028")
+        );
+        assert!(!ids.devices.values().any(|v| v.contains("PowerEdge")));
     }
 
     #[test]
@@ -348,17 +369,39 @@ C 03  Display controller
 
     #[test]
     fn device_name_resolves_a_known_pair() {
-        // Uses the real system database when one is installed.
-        match device_name("0x8086", "0x9a49") {
-            Some(name) => assert!(!name.is_empty()),
-            None => assert!(ids().vendors.is_empty(), "no pci.ids on this machine"),
-        }
+        let ids = parse_ids(PCI_IDS);
+
+        assert_eq!(
+            ids.device_name("0x8086", "0x9a49").as_deref(),
+            Some("Intel Corporation Meteor Lake-P [Intel Arc Graphics]")
+        );
+        assert_eq!(
+            ids.describe("0x15ad", "0xffff", "unknown"),
+            "VMware, Inc.",
+            "an unknown device falls back to its vendor"
+        );
+        assert_eq!(ids.describe("0xdead", "0xbeef", "unknown"), "unknown");
     }
 
     #[test]
     fn device_name_is_none_for_an_unknown_or_malformed_id() {
-        assert_eq!(device_name("nope", "0x0000"), None);
-        assert_eq!(device_name("0x8086", "nope"), None);
+        let ids = parse_ids(PCI_IDS);
+
+        assert_eq!(ids.device_name("nope", "0x0000"), None);
+        assert_eq!(ids.device_name("0x8086", "nope"), None);
+    }
+
+    #[test]
+    fn ids_load_from_the_hwdata_path() {
+        let fx = Fixture::new();
+        fx.write("usr/share/hwdata/pci.ids", PCI_IDS);
+
+        let ids = Ids::load(&fx.host());
+        assert_eq!(
+            ids.vendor_name("0x1002").as_deref(),
+            Some("Advanced Micro Devices, Inc. [AMD/ATI]")
+        );
+        assert!(Ids::load(&Fixture::new().host()).vendors.is_empty());
     }
 
     // ---- looks_like_slot -------------------------------------------------
@@ -379,37 +422,72 @@ C 03  Display controller
         assert!(!looks_like_slot("pci0000:00"));
         assert!(!looks_like_slot("0000:00:02"), "no function");
         assert!(!looks_like_slot("0000:00:02.0.1"), "too many parts");
+        assert!(!looks_like_slot("0000:00:02:1.0"), "too many colons");
         assert!(!looks_like_slot("0000:00:02.x"), "function is not hex");
         assert!(!looks_like_slot(""));
         assert!(!looks_like_slot("drm"));
     }
 
-    // ---- live ------------------------------------------------------------
+    // ---- pci_slot_of -------------------------------------------------------
 
     #[test]
-    fn rows_render_without_panicking() {
-        let rows = rows();
-        let text: String = rows.iter().map(|r| format!("{r:?}")).collect();
-        assert!(!text.contains("NaN"), "{text}");
-        assert!(!text.contains("null"), "{text}");
+    fn a_gpu_behind_bridges_resolves_to_its_own_slot() {
+        // The layout of a discrete GPU: root port, then the card's own
+        // upstream and downstream switch ports, then the GPU.
+        let fx = Fixture::new();
+        fx.mkdir("sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:02:00.0/0000:03:00.0");
+        fx.symlink(
+            "sys/class/drm/card1/device",
+            "../../../devices/pci0000:00/0000:00:01.0/0000:01:00.0/0000:02:00.0/0000:03:00.0",
+        );
+
+        assert_eq!(
+            pci_slot_of(&fx.dir().join("sys/class/drm/card1/device")).as_deref(),
+            Some("0000:03:00.0")
+        );
     }
 
     #[test]
-    fn pci_slot_of_a_real_drm_card_looks_like_a_slot() {
-        let drm = Path::new("/sys/class/drm");
-        if !drm.exists() {
-            return;
-        }
-        for entry in super::super::fs::list_dir(drm) {
-            let Some(name) = entry.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if !name.starts_with("card") {
-                continue;
-            }
-            if let Some(slot) = pci_slot_of(&entry) {
-                assert!(looks_like_slot(&slot), "{slot:?}");
-            }
-        }
+    fn an_integrated_gpu_on_the_root_complex_resolves_to_its_slot() {
+        let fx = Fixture::new();
+        fx.mkdir("sys/devices/pci0000:00/0000:00:02.0");
+        fx.symlink(
+            "sys/class/drm/card0/device",
+            "../../../devices/pci0000:00/0000:00:02.0",
+        );
+
+        assert_eq!(
+            pci_slot_of(&fx.dir().join("sys/class/drm/card0/device")).as_deref(),
+            Some("0000:00:02.0")
+        );
+    }
+
+    // ---- rows --------------------------------------------------------------
+
+    #[test]
+    fn rows_list_each_device_with_its_name_driver_and_ids() {
+        let fx = Fixture::new();
+        let dev = "sys/bus/pci/devices/0000:00:02.0";
+        fx.write(&format!("{dev}/class"), "0x030000\n");
+        fx.write(&format!("{dev}/vendor"), "0x8086\n");
+        fx.write(&format!("{dev}/device"), "0x9a49\n");
+        fx.symlink(&format!("{dev}/driver"), "../../../bus/pci/drivers/i915");
+        let rows = rows(&fx.host(), &parse_ids(PCI_IDS));
+
+        assert_eq!(
+            rows,
+            [Row::field(
+                "0000:00:02.0  i915",
+                "Intel Corporation Meteor Lake-P [Intel Arc Graphics]  [0x030000 0x8086:0x9a49]"
+            )]
+        );
+    }
+
+    #[test]
+    fn a_machine_without_pci_says_so() {
+        assert_eq!(
+            rows(&Fixture::new().host(), &Ids::default()),
+            [Row::note("no pci bus")]
+        );
     }
 }

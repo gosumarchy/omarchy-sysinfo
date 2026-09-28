@@ -3,9 +3,10 @@
 //! That file is a flat list of `key = "value"` pairs, so a full TOML parser
 //! would be overkill; this reads the handful of keys the UI needs.
 
+use crate::collect::{Host, omarchy};
 use crate::term::Color;
 
-#[derive(Clone)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Palette {
     pub(crate) accent: Color,
     pub(crate) background: Color,
@@ -15,7 +16,6 @@ pub(crate) struct Palette {
     pub(crate) red: Color,
     pub(crate) yellow: Color,
     pub(crate) green: Color,
-    pub(crate) selection: Color,
 }
 
 impl Default for Palette {
@@ -29,32 +29,25 @@ impl Default for Palette {
             red: Color::Rgb(0xbf, 0x61, 0x6a),
             yellow: Color::Rgb(0xeb, 0xcb, 0x8b),
             green: Color::Rgb(0xa3, 0xbe, 0x8c),
-            selection: Color::Rgb(0x43, 0x4c, 0x5e),
         }
     }
 }
 
 impl Palette {
     /// Read the theme Omarchy says is current, falling back to a dark default.
-    pub(crate) fn from_omarchy() -> Palette {
+    ///
+    /// The theme is found the same way the Omarchy section finds it, so a
+    /// user-installed theme under `~/.config/omarchy/themes` is honoured too.
+    pub(crate) fn from_omarchy(host: &Host) -> Palette {
         let mut palette = Palette::default();
 
-        let theme_name = std::fs::read_to_string(
-            std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-                .join(".local/state/omarchy/current/theme.name"),
-        )
-        .map(|s| s.trim().to_string())
-        .unwrap_or_default();
-        if theme_name.is_empty() {
-            return palette;
-        }
-
-        let path = format!("/usr/share/omarchy/themes/{theme_name}/colors.toml");
-        let Ok(text) = std::fs::read_to_string(path) else {
+        let Some(text) = omarchy::theme_dir(host)
+            .and_then(|dir| std::fs::read_to_string(dir.join("colors.toml")).ok())
+        else {
             return palette;
         };
-        let table = parse_pairs(&text);
-        apply_table(&mut palette, &table);
+        apply_table(&mut palette, &parse_pairs(&text));
+
         palette
     }
 }
@@ -82,9 +75,6 @@ fn apply_table(palette: &mut Palette, table: &[(String, String)]) {
     }
     if let Some(c) = lookup(&["cyan"]) {
         palette.heading = c;
-    }
-    if let Some(c) = lookup(&["selection"]) {
-        palette.selection = c;
     }
     if let Some(c) = lookup(&["red"]) {
         palette.red = c;
@@ -154,6 +144,7 @@ pub(crate) fn heat(fraction: f64, palette: &Palette) -> Color {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::collect::fixture::Fixture;
 
     fn get<'a>(table: &'a [(String, String)], key: &str) -> Option<&'a str> {
         table
@@ -280,7 +271,6 @@ green = "#a3be8c"
         assert_eq!(p.background, Color::Rgb(0x2e, 0x34, 0x40));
         assert_eq!(p.foreground, Color::Rgb(0xec, 0xef, 0xf4));
         assert_eq!(p.accent, Color::Rgb(0x88, 0xc0, 0xd0));
-        assert_eq!(p.selection, Color::Rgb(0x43, 0x4c, 0x5e));
         assert_eq!(
             p.heading,
             Color::Rgb(0x8f, 0xbc, 0xbb),
@@ -312,7 +302,7 @@ green = "#a3be8c"
         let mut p = Palette::default();
         apply_table(&mut p, &parse_pairs("accent = \"#123456\"\n"));
         assert_eq!(p.accent, Color::Rgb(0x12, 0x34, 0x56));
-        let mut after = before.clone();
+        let mut after = before;
         after.accent = Color::Rgb(0x12, 0x34, 0x56);
         assert_eq!(p.accent, after.accent);
         assert_eq!(p.background, after.background);
@@ -331,10 +321,24 @@ green = "#a3be8c"
     }
 
     #[test]
+    fn from_omarchy_reads_the_active_theme() {
+        let fx = Fixture::new();
+        fx.write(
+            "home/user/.local/state/omarchy/current/theme.name",
+            "nord\n",
+        );
+        fx.write("usr/share/omarchy/themes/nord/colors.toml", REAL_THEME);
+
+        let p = Palette::from_omarchy(&fx.host());
+        assert_eq!(p.accent, Color::Rgb(0x88, 0xc0, 0xd0));
+        assert_eq!(p.background, Color::Rgb(0x2e, 0x34, 0x40));
+    }
+
+    #[test]
     fn from_omarchy_always_yields_a_usable_palette() {
-        // Whatever the machine has installed, this must not panic and must
-        // return something renderable.
-        let p = Palette::from_omarchy();
+        // With no theme recorded, the default must still be fully specified.
+        let p = Palette::from_omarchy(&Fixture::new().host());
+        assert_eq!(p, Palette::default());
         for (name, c) in [
             ("accent", p.accent),
             ("background", p.background),

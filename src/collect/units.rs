@@ -5,6 +5,44 @@
 //! The helpers here are the one place that knows how those map onto "1.5 GiB"
 //! and "12.3 W", so the arithmetic is not repeated in twelve collectors.
 
+/// A counter as a float, for display and ratios only.
+///
+/// Above 2^53 the result is rounded, which no reader of "1.5 TiB" will ever
+/// notice; the one place precision matters, parsing, never goes through here.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "display-only conversion; see the doc comment"
+)]
+pub(crate) fn approx_f64(value: u64) -> f64 {
+    value as f64
+}
+
+/// `part / whole`, or zero when there is no whole to divide by.
+pub(crate) fn fraction(part: u64, whole: u64) -> f64 {
+    if whole == 0 {
+        0.0
+    } else {
+        approx_f64(part) / approx_f64(whole)
+    }
+}
+
+/// A non-negative float rounded to the nearest whole number, saturating at
+/// the ends of `u64` (NaN counts as zero).
+#[expect(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    reason = "the value is clamped into u64's range first"
+)]
+pub(crate) fn round_u64(value: f64) -> u64 {
+    if value.is_nan() || value <= 0.0 {
+        0
+    } else if value >= approx_f64(u64::MAX) {
+        u64::MAX
+    } else {
+        value.round() as u64
+    }
+}
+
 /// Bytes as a binary-prefixed size, e.g. `1.5 KiB`.
 ///
 /// The unit table stops at TiB, so a value beyond that keeps counting up in TiB
@@ -16,7 +54,7 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
         return format!("{bytes} B");
     }
 
-    let mut value = bytes as f64;
+    let mut value = approx_f64(bytes);
     let mut unit = 0;
 
     while value >= 1024.0 && unit < UNITS.len() - 1 {
@@ -30,7 +68,7 @@ pub(crate) fn human_bytes(bytes: u64) -> String {
 /// A clock speed, switching to GHz at 1000 MHz.
 pub(crate) fn human_mhz(mhz: u64) -> String {
     if mhz >= 1000 {
-        format!("{:.2} GHz", mhz as f64 / 1000.0)
+        format!("{:.2} GHz", approx_f64(mhz) / 1000.0)
     } else {
         format!("{mhz} MHz")
     }
@@ -38,7 +76,7 @@ pub(crate) fn human_mhz(mhz: u64) -> String {
 
 /// Battery energy, which the kernel reports in micro-watt-hours rather than bytes.
 pub(crate) fn human_energy(uwh: u64) -> String {
-    let wh = uwh as f64 / 1_000_000.0;
+    let wh = approx_f64(uwh) / 1_000_000.0;
 
     if wh >= 1000.0 {
         format!("{:.2} kWh", wh / 1000.0)
@@ -49,7 +87,7 @@ pub(crate) fn human_energy(uwh: u64) -> String {
 
 /// Power draw in watts, promoting to kilowatts past 1000 W.
 pub(crate) fn human_watts(uw: u64) -> String {
-    let w = uw as f64 / 1_000_000.0;
+    let w = approx_f64(uw) / 1_000_000.0;
 
     if w >= 1000.0 {
         format!("{:.2} kW", w / 1000.0)
@@ -58,7 +96,8 @@ pub(crate) fn human_watts(uw: u64) -> String {
     }
 }
 
-/// A duration, showing only the two largest units that are non-zero.
+/// A duration as its three largest units, starting from the largest that is
+/// non-zero: `2d 3h 4m`, `3h 4m 5s`, `4m 5s`.
 pub(crate) fn human_secs(secs: u64) -> String {
     let d = secs / 86_400;
     let h = (secs % 86_400) / 3_600;
@@ -74,6 +113,50 @@ pub(crate) fn human_secs(secs: u64) -> String {
     }
 }
 
+/// Seconds since the epoch as a UTC timestamp, `2026-09-28 14:05 UTC`.
+///
+/// The local zone would need a tzdata parser; UTC is unambiguous and the
+/// report shows the zone name next to it anyway.
+pub(crate) fn utc_timestamp(epoch: u64) -> String {
+    let days = epoch / 86_400;
+    let secs = epoch % 86_400;
+    let (year, month, day) = civil_from_days(days);
+
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02} UTC",
+        secs / 3_600,
+        (secs % 3_600) / 60
+    )
+}
+
+/// Days since 1970-01-01 to a proleptic Gregorian date.
+///
+/// Howard Hinnant's `civil_from_days`, restricted to non-negative day counts
+/// since nothing here predates the epoch.
+fn civil_from_days(days: u64) -> (u64, u64, u64) {
+    let z = days + 719_468;
+    let era = z / 146_097;
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1_460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + u64::from(month <= 2);
+
+    (year, month, day)
+}
+
+/// `wifi` → `Wifi`: the first character uppercased, the rest untouched.
+pub(crate) fn capitalise(s: &str) -> String {
+    let mut chars = s.chars();
+
+    match chars.next() {
+        Some(first) => first.to_uppercase().chain(chars).collect(),
+        None => String::new(),
+    }
+}
+
 /// Stand in for a value the machine did not report, so a row keeps its shape and
 /// the reader can see that something was looked for and not found.
 pub(crate) fn dash(value: Option<String>) -> String {
@@ -81,6 +164,10 @@ pub(crate) fn dash(value: Option<String>) -> String {
 }
 
 #[cfg(test)]
+#[expect(
+    clippy::float_cmp,
+    reason = "these tests pin exact, exactly representable results"
+)]
 mod tests {
     use super::*;
 
@@ -199,5 +286,48 @@ mod tests {
     fn dash_replaces_missing_values() {
         assert_eq!(dash(Some("x".into())), "x");
         assert_eq!(dash(None), "-");
+    }
+
+    // ---- fraction / round_u64 ---------------------------------------------
+
+    #[test]
+    fn fraction_of_nothing_is_zero_not_nan() {
+        assert_eq!(fraction(5, 0), 0.0);
+        assert_eq!(fraction(1, 4), 0.25);
+    }
+
+    #[test]
+    fn round_u64_saturates_and_pins_nan() {
+        assert_eq!(round_u64(2.5), 3);
+        assert_eq!(round_u64(-1.0), 0);
+        assert_eq!(round_u64(f64::NAN), 0);
+        assert_eq!(round_u64(f64::INFINITY), u64::MAX);
+    }
+
+    // ---- utc_timestamp ---------------------------------------------------
+
+    #[test]
+    fn utc_timestamp_formats_known_instants() {
+        assert_eq!(utc_timestamp(0), "1970-01-01 00:00 UTC");
+        // 2000-02-29 is the leap day a naive year/4 rule gets right and a
+        // century rule gets wrong.
+        assert_eq!(utc_timestamp(951_782_400), "2000-02-29 00:00 UTC");
+        assert_eq!(utc_timestamp(1_790_604_300), "2026-09-28 14:05 UTC");
+    }
+
+    // ---- capitalise --------------------------------------------------------
+
+    #[test]
+    fn capitalise_uppercases_only_the_first_character() {
+        assert_eq!(capitalise("wifi"), "Wifi");
+        assert_eq!(capitalise("systemd-timesyncd"), "Systemd-timesyncd");
+        assert_eq!(capitalise("rx bitrate"), "Rx bitrate");
+        assert_eq!(capitalise("Bluetooth"), "Bluetooth");
+    }
+
+    #[test]
+    fn capitalise_copes_with_empty_and_non_ascii() {
+        assert_eq!(capitalise(""), "");
+        assert_eq!(capitalise("über"), "Über");
     }
 }

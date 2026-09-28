@@ -1,19 +1,34 @@
 //! Keyboard decoding with no crates. A background thread blocks on stdin and
-//! sends decoded keys down a channel; the main loop waits with a timeout so it
-//! can still refresh on a timer.
+//! sends decoded keys down the event channel; the main loop waits on that
+//! channel alongside fresh snapshots.
 
 use std::io::Read;
-use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
+use std::sync::mpsc::Sender;
 use std::time::Duration;
+
+use crate::event::Event;
 
 /// Ceiling on buffered input bytes. A terminal that opens an escape sequence and
 /// never finishes it would otherwise grow the buffer for the life of the
 /// process and stop decoding any key at all.
 const MAX_PENDING: usize = 4096;
 
+/// How long a lone ESC waits for the rest of a sequence.
+///
+/// A terminal writes an escape sequence in one go, but over ssh or a slow
+/// pty it can arrive split, and an arrow key read as Esc-then-`[A` quit the
+/// app. This is long enough to join a split sequence and short enough that
+/// the Esc key still feels immediate.
+const ESC_WAIT: Duration = Duration::from_millis(30);
+
+const STDIN: i32 = 0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum Key {
     Char(char),
+    /// Alt held with a printable key, which terminals send as ESC then the
+    /// key. Decoding it as Esc used to make any Alt chord quit the app.
+    Alt(char),
     Up,
     Down,
     Left,
@@ -59,14 +74,18 @@ impl InputBuffer {
         None
     }
 
+    /// Whether all that is buffered is one ESC, which may be the Esc key or
+    /// the first byte of a sequence whose rest has not arrived yet.
+    fn is_lone_escape(&self) -> bool {
+        self.bytes == [0x1b]
+    }
+
     /// Pull one key off the front, if there is a complete one.
     fn take_key(&mut self) -> Option<Key> {
         let first = *self.bytes.first()?;
 
-        // A lone ESC is the Esc key. Terminals write a whole escape sequence in
-        // one go, so anything already buffered is a sequence and anything else is
-        // Esc. Waiting for more bytes here would mean Esc only took effect once
-        // the next key arrived.
+        // A lone ESC is the Esc key: the reader has already given the rest
+        // of a sequence `ESC_WAIT` to turn up.
         if first == 0x1b {
             if self.bytes.len() == 1 {
                 self.bytes.clear();
@@ -74,7 +93,7 @@ impl InputBuffer {
                 return Some(Key::Esc);
             }
 
-            return self.parse_csi();
+            return self.parse_escape();
         }
 
         // UTF-8: figure out how long the character is before decoding it.
@@ -87,30 +106,7 @@ impl InputBuffer {
             return Some(Key::Unknown);
         }
         if needed > 1 {
-            // Validate the continuation bytes already buffered. If one of them is
-            // not a continuation byte the sequence is definitively malformed, so
-            // drop just the bad lead and resync -- otherwise we would sit waiting
-            // for `needed` bytes and then swallow the real keystroke that followed
-            // (a stray ESC-prefixed 0x28 used to eat the 'a' typed after it).
-            if self.bytes[1..].iter().any(|b| !(0x80..=0xbf).contains(b)) {
-                self.bytes.remove(0);
-
-                return Some(Key::Unknown);
-            }
-            if self.bytes.len() < needed {
-                // Wait for the rest of the character. A multi-byte char can land
-                // across two reads, and discarding the partial bytes here used to
-                // swallow the character entirely.
-                return None;
-            }
-            let mut bytes = [0u8; 4];
-            bytes[..needed].copy_from_slice(&self.bytes[..needed]);
-            self.bytes.drain(..needed);
-
-            return match std::str::from_utf8(&bytes[..needed]) {
-                Ok(s) => s.chars().next().map(Key::Char),
-                Err(_) => Some(Key::Unknown),
-            };
+            return self.take_multibyte(needed);
         }
 
         self.bytes.remove(0);
@@ -119,77 +115,119 @@ impl InputBuffer {
             0x09 => Key::Tab,
             0x7f | 0x08 => Key::Backspace,
             0x03 => Key::CtrlC,
-            other => Key::Char(other as char),
+            // Other control bytes (Ctrl+letter) are not bound to anything and
+            // must not end up typed into the filter.
+            0x00..=0x1f => Key::Unknown,
+            other => Key::Char(char::from(other)),
         })
     }
 
-    /// Parse a CSI/SS3 sequence, leaving anything unrecognised consumed.
-    fn parse_csi(&mut self) -> Option<Key> {
-        match self.bytes.get(1) {
-            Some(b'[') => {
-                // xterm style: ESC [ <params> <final byte>
-                let mut end = 2;
-                while end < self.bytes.len() && !(0x40..=0x7e).contains(&self.bytes[end]) {
-                    end += 1;
-                }
-                if end >= self.bytes.len() {
-                    // Incomplete: keep the bytes and wait for the next read, since
-                    // a split CSI would otherwise lose the key entirely. The
-                    // ceiling in `extend` stops a never-finished sequence from
-                    // wedging the decoder.
-                    return None;
-                }
-                let params: String = self.bytes[2..end].iter().map(|b| *b as char).collect();
-                let final_byte = self.bytes[end];
-                self.bytes.drain(..=end);
+    fn take_multibyte(&mut self, needed: usize) -> Option<Key> {
+        // Validate the continuation bytes already buffered. If one of them is
+        // not a continuation byte the sequence is definitively malformed, so
+        // drop just the bad lead and resync -- otherwise we would sit waiting
+        // for `needed` bytes and then swallow the real keystroke that followed
+        // (a stray ESC-prefixed 0x28 used to eat the 'a' typed after it).
+        let continuation = self.bytes.iter().skip(1).take(needed - 1);
+        if continuation.clone().any(|b| !(0x80..=0xbf).contains(b)) {
+            self.bytes.remove(0);
 
-                let key = match final_byte {
-                    b'A' => Key::Up,
-                    b'B' => Key::Down,
-                    b'C' => Key::Right,
-                    b'D' => Key::Left,
-                    b'H' => Key::Home,
-                    b'F' => Key::End,
-                    b'~' => match params.split(';').next() {
-                        Some("1") | Some("7") => Key::Home,
-                        Some("4") | Some("8") => Key::End,
-                        Some("5") => Key::PageUp,
-                        Some("6") => Key::PageDown,
-                        _ => Key::Unknown,
-                    },
-                    _ => Key::Unknown,
-                };
-                Some(key)
+            return Some(Key::Unknown);
+        }
+        if self.bytes.len() < needed {
+            // Wait for the rest of the character. A multi-byte char can land
+            // across two reads, and discarding the partial bytes here used to
+            // swallow the character entirely.
+            return None;
+        }
+
+        let decoded = std::str::from_utf8(&self.bytes[..needed])
+            .ok()
+            .and_then(|s| s.chars().next());
+        self.bytes.drain(..needed);
+
+        Some(decoded.map_or(Key::Unknown, Key::Char))
+    }
+
+    /// ESC followed by at least one more byte: a CSI or SS3 sequence, an
+    /// Alt chord, or an Esc press followed by something else.
+    fn parse_escape(&mut self) -> Option<Key> {
+        match self.bytes.get(1).copied() {
+            Some(b'[') => self.parse_csi(),
+            Some(b'O') => self.parse_ss3(),
+            Some(byte @ 0x20..=0x7e) => {
+                self.bytes.drain(..2);
+
+                Some(Key::Alt(char::from(byte)))
             }
-            Some(b'O') => {
-                // Application cursor keys: ESC O <final byte>
-                if self.bytes.len() < 3 {
-                    return None;
-                }
-                let final_byte = self.bytes[2];
-                self.bytes.drain(..3);
-                Some(match final_byte {
-                    b'A' => Key::Up,
-                    b'B' => Key::Down,
-                    b'C' => Key::Right,
-                    b'D' => Key::Left,
-                    b'H' => Key::Home,
-                    b'F' => Key::End,
-                    _ => Key::Unknown,
-                })
-            }
-            _ => {
-                // ESC followed by a normal key, e.g. alt combos.
+            // ESC then something that is not a printable key: deliver Esc and
+            // let the next byte decode on its own.
+            Some(_) | None => {
                 self.bytes.remove(0);
+
                 Some(Key::Esc)
             }
         }
     }
+
+    /// xterm style: `ESC [ <params> <final byte>`.
+    fn parse_csi(&mut self) -> Option<Key> {
+        let Some(offset) = self.bytes[2..]
+            .iter()
+            .position(|b| (0x40..=0x7e).contains(b))
+        else {
+            // Incomplete: keep the bytes and wait for the next read, since a
+            // split CSI would otherwise lose the key entirely. The ceiling in
+            // `extend` stops a never-finished sequence from wedging the
+            // decoder.
+            return None;
+        };
+        let end = 2 + offset;
+        let params = String::from_utf8_lossy(&self.bytes[2..end]).into_owned();
+        let final_byte = self.bytes[end];
+        self.bytes.drain(..=end);
+
+        Some(match final_byte {
+            b'A' => Key::Up,
+            b'B' => Key::Down,
+            b'C' => Key::Right,
+            b'D' => Key::Left,
+            b'H' => Key::Home,
+            b'F' => Key::End,
+            b'~' => match params.split(';').next() {
+                Some("1" | "7") => Key::Home,
+                Some("4" | "8") => Key::End,
+                Some("5") => Key::PageUp,
+                Some("6") => Key::PageDown,
+                // Insert, Delete, F-keys and bracketed paste are not bound.
+                Some(_) | None => Key::Unknown,
+            },
+            // Every other final byte is a key or a report nothing binds.
+            _ => Key::Unknown,
+        })
+    }
+
+    /// Application cursor keys: `ESC O <final byte>`.
+    fn parse_ss3(&mut self) -> Option<Key> {
+        let final_byte = *self.bytes.get(2)?;
+        self.bytes.drain(..3);
+
+        Some(match final_byte {
+            b'A' => Key::Up,
+            b'B' => Key::Down,
+            b'C' => Key::Right,
+            b'D' => Key::Left,
+            b'H' => Key::Home,
+            b'F' => Key::End,
+            // F1-F4 and keypad keys are not bound.
+            _ => Key::Unknown,
+        })
+    }
 }
 
-/// Spawn the reader thread. It exits when stdin closes.
-pub(crate) fn spawn() -> Receiver<Key> {
-    let (tx, rx) = mpsc::channel();
+/// Spawn the reader thread. It sends `InputClosed` and exits when stdin
+/// closes or the receiving end is dropped.
+pub(crate) fn spawn(events: Sender<Event>) {
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
         let mut pending = InputBuffer::default();
@@ -197,68 +235,48 @@ pub(crate) fn spawn() -> Receiver<Key> {
 
         loop {
             let n = match stdin.read(&mut buf) {
-                // stdin closed: drop the sender so the main loop sees the
-                // channel disconnect and shuts down.
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => {
+                    let _ = events.send(Event::InputClosed);
+
+                    return;
+                }
                 Ok(n) => n,
             };
 
             // A dropped buffer reports itself as a key before the drain below,
             // so the user sees the input recover rather than the app hang.
-            if let Some(key) = pending.extend(&buf[..n]) {
-                if tx.send(key).is_err() {
-                    return;
-                }
+            if let Some(key) = pending.extend(&buf[..n])
+                && events.send(Event::Key(key)).is_err()
+            {
+                return;
+            }
+
+            // Give a lone ESC a moment to become a sequence before calling it
+            // the Esc key.
+            if pending.is_lone_escape() && crate::sys::wait_readable(STDIN, ESC_WAIT) {
+                continue;
             }
 
             // Consume whole keys from the front of the buffer.
             while let Some(key) = pending.take_key() {
-                if tx.send(key).is_err() {
+                if events.send(Event::Key(key)).is_err() {
                     return;
                 }
             }
         }
     });
-    rx
 }
 
 /// How many bytes `first` announces, or 0 when it cannot start a character.
 /// 0xc0/0xc1 (overlong) and 0xf5..=0xff (beyond U+10FFFF) are rejected here;
-/// from_utf8 would catch them too, but rejecting early keeps the table honest.
+/// `from_utf8` would catch them too, but rejecting early keeps the table honest.
 fn utf8_len(first: u8) -> usize {
     match first {
         0x00..=0x7f => 1,
         0xc2..=0xdf => 2,
         0xe0..=0xef => 3,
         0xf0..=0xf4 => 4,
-        _ => 0,
-    }
-}
-
-/// Collapse a run of `r` into one refresh, and let quit jump the queue.
-///
-/// A held key repeats faster than a collect finishes, so the channel fills
-/// with refreshes and `q` sits behind them until each one has blocked.
-pub(crate) fn coalesce_refresh(key: Key, rx: &Receiver<Key>) -> Vec<Key> {
-    if key != Key::Char('r') {
-        return vec![key];
-    }
-    while let Ok(next) = rx.try_recv() {
-        match next {
-            Key::Char('r') => {}
-            Key::Char('q') | Key::CtrlC | Key::Esc => return vec![next],
-            other => return vec![key, other],
-        }
-    }
-    vec![key]
-}
-
-/// Wait for a key, giving up after `timeout` so the caller can refresh.
-pub(crate) fn next_key(rx: &Receiver<Key>, timeout: Duration) -> Option<Key> {
-    match rx.recv_timeout(timeout) {
-        Ok(key) => Some(key),
-        Err(RecvTimeoutError::Timeout) => None,
-        Err(RecvTimeoutError::Disconnected) => Some(Key::CtrlC),
+        0x80..=0xc1 | 0xf5..=0xff => 0,
     }
 }
 
@@ -331,7 +349,7 @@ mod tests {
     fn many_keys_in_one_read_all_decode() {
         let keys = feed(&[b"abcdefghij\r\tq"]);
         assert_eq!(keys.len(), 13);
-        assert_eq!(*keys.last().unwrap(), Key::Char('q'));
+        assert_eq!(keys.last(), Some(&Key::Char('q')));
     }
 
     // ---- CSI arrows ------------------------------------------------------
@@ -445,6 +463,16 @@ mod tests {
     }
 
     #[test]
+    fn a_multibyte_char_followed_by_ascii_in_one_read_decodes_both() {
+        // The continuation check used to look at every buffered byte, not
+        // just the character's own, so the 'a' made the 'é' "malformed".
+        assert_eq!(
+            feed(&["éa".as_bytes()]),
+            vec![Key::Char('é'), Key::Char('a')]
+        );
+    }
+
+    #[test]
     fn multibyte_and_ascii_mix_keeps_order() {
         let keys = feed(&["a".as_bytes(), "é".as_bytes(), b"z"]);
         assert_eq!(keys, vec![Key::Char('a'), Key::Char('é'), Key::Char('z')]);
@@ -503,9 +531,35 @@ mod tests {
     // ---- alt / esc combinations -----------------------------------------
 
     #[test]
-    fn esc_followed_by_a_plain_key_yields_esc_then_the_key() {
-        // Alt+x arrives as ESC x. The Esc must not swallow the 'x'.
-        assert_eq!(feed(&[b"\x1bx"]), vec![Key::Esc, Key::Char('x')]);
+    fn esc_followed_by_a_printable_key_is_an_alt_chord() {
+        // Alt+x arrives as ESC x. Decoding it as Esc then 'x' made every Alt
+        // chord quit the app.
+        assert_eq!(feed(&[b"\x1bx"]), vec![Key::Alt('x')]);
+        assert_eq!(feed(&[b"\x1bq"]), vec![Key::Alt('q')]);
+    }
+
+    #[test]
+    fn esc_followed_by_a_control_byte_is_esc_then_that_key() {
+        assert_eq!(feed(&[b"\x1b\r"]), vec![Key::Esc, Key::Enter]);
+        assert_eq!(feed(&[b"\x1b\x1b"]), vec![Key::Esc, Key::Esc]);
+    }
+
+    #[test]
+    fn a_lone_escape_is_recognised_as_such() {
+        let mut pending = InputBuffer::default();
+        pending.extend(b"\x1b");
+        assert!(pending.is_lone_escape());
+        pending.extend(b"[");
+        assert!(!pending.is_lone_escape());
+    }
+
+    #[test]
+    fn unbound_control_bytes_are_not_typed_characters() {
+        // Ctrl+W, Ctrl+Z and NUL used to arrive as Key::Char and be typed
+        // into the filter, then drawn raw onto the terminal.
+        assert_eq!(one(b"\x17"), Key::Unknown);
+        assert_eq!(one(b"\x1a"), Key::Unknown);
+        assert_eq!(one(b"\x00"), Key::Unknown);
     }
 
     // ---- buffer safety ---------------------------------------------------

@@ -1,48 +1,54 @@
-use super::{Row, units::dash};
+//! Monitor layout as Hyprland reports it. This is the only source that knows
+//! about scaling, position and refresh rate on a Wayland compositor.
 
-/// Monitor layout as Hyprland reports it. This is the only source that knows
-/// about scaling, position and refresh rate on a Wayland compositor.
-pub(crate) fn rows() -> Vec<Row> {
-    let Some(out) = hyprctl("monitors") else {
-        return vec![Row::note("hyprctl unavailable (not running Hyprland?)")];
+use super::{Host, Row};
+
+pub(crate) fn rows(host: &Host) -> Vec<Row> {
+    let Some(monitors) = host.hypr("monitors") else {
+        return vec![Row::note("Hyprland not reachable (not running Hyprland?)")];
     };
 
-    let mut rows = parse_monitors(&out);
+    let mut rows = parse_monitors(&monitors);
 
-    if let Some(workspaces) = hyprctl("workspaces") {
-        let used = workspaces
-            .lines()
-            .filter(|l| l.trim_start().starts_with("workspace "))
-            // Special workspaces are numbered -99, -98 and count as active
-            // even when no window occupies them.
-            .filter(|l| {
-                l.trim_start()
-                    .strip_prefix("workspace ")
-                    .and_then(|r| r.split_whitespace().next())
-                    .and_then(|n| n.parse::<i64>().ok())
-                    .is_some_and(|n| n > 0)
-            })
-            .count();
-        rows.push(Row::Header("Wayland compositor".into()));
-        rows.push(Row::field("Active workspaces", used.to_string()));
-        if let Some(focused) = hyprctl("activewindow") {
-            let title = focused
-                .lines()
-                .find(|l| l.trim_start().starts_with("title:"))
-                .map(|l| {
-                    l.trim_start()
-                        .trim_start_matches("title:")
-                        .trim()
-                        .to_string()
-                });
-            rows.push(Row::field("Focused window", dash(title)));
+    if let Some(workspaces) = host.hypr("workspaces") {
+        rows.push(Row::header("Wayland compositor"));
+        rows.push(Row::field(
+            "Active workspaces",
+            count_workspaces(&workspaces).to_string(),
+        ));
+        if let Some(title) = host.hypr("activewindow").and_then(|w| window_title(&w)) {
+            // Whatever the user is looking at: a document name, a chat, a
+            // web page title. Shown in the TUI, withheld from the plain
+            // report unless asked for.
+            rows.push(Row::identifier("Focused window", title));
         }
     }
 
     if rows.is_empty() {
         rows.push(Row::note("no monitor information"));
     }
+
     rows
+}
+
+/// Regular workspaces. Special workspaces are numbered -99, -98 and count as
+/// active even when no window occupies them.
+fn count_workspaces(workspaces: &str) -> usize {
+    workspaces
+        .lines()
+        .filter_map(|l| l.trim_start().strip_prefix("workspace ID "))
+        .filter_map(|rest| rest.split_whitespace().next())
+        .filter_map(|n| n.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .count()
+}
+
+fn window_title(activewindow: &str) -> Option<String> {
+    activewindow
+        .lines()
+        .find_map(|l| l.trim_start().strip_prefix("title:"))
+        .map(|t| t.trim().to_string())
+        .filter(|t| !t.is_empty())
 }
 
 /// Turn `hyprctl monitors` output into a header and field rows per monitor.
@@ -52,80 +58,41 @@ pub(crate) fn rows() -> Vec<Row> {
 /// first one separates the key.
 fn parse_monitors(out: &str) -> Vec<Row> {
     let mut rows = Vec::new();
-    let mut current: Option<(String, Vec<(String, String)>)> = None;
+    let mut in_monitor = false;
 
     for line in out.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
         }
+
         if let Some(rest) = trimmed.strip_prefix("Monitor ") {
-            flush(&mut rows, &mut current);
             // Only the heading's own trailing colon is punctuation.
-            let name = rest.strip_suffix(':').unwrap_or(rest).trim().to_string();
-            if !name.is_empty() {
-                current = Some((name, Vec::new()));
+            let name = rest.strip_suffix(':').unwrap_or(rest).trim();
+            in_monitor = !name.is_empty();
+            if in_monitor {
+                rows.push(Row::header(name));
             }
             continue;
         }
+
         let Some((key, value)) = trimmed.split_once(':') else {
             continue;
         };
-        let (key, value) = (key.trim().to_string(), value.trim().to_string());
-        if matches!(key.as_str(), "description" | "make" | "model" | "serial")
-            && (value.is_empty() || value == "N/A")
-        {
+        let (key, value) = (key.trim(), value.trim());
+        let identity = matches!(key, "description" | "make" | "model" | "serial");
+        if !in_monitor || (identity && (value.is_empty() || value == "N/A")) {
             continue;
         }
-        if let Some((_, pairs)) = current.as_mut() {
-            pairs.push((key, value));
-        }
+
+        rows.push(if key == "serial" {
+            Row::identifier(key, value)
+        } else {
+            Row::field(key, value)
+        });
     }
-    flush(&mut rows, &mut current);
+
     rows
-}
-
-fn flush(rows: &mut Vec<Row>, current: &mut Option<(String, Vec<(String, String)>)>) {
-    if let Some((name, pairs)) = current.take() {
-        rows.push(Row::Header(name));
-        for (k, v) in pairs {
-            rows.push(Row::field(k, v));
-        }
-    }
-}
-
-fn hyprctl(what: &str) -> Option<String> {
-    if std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_err() {
-        return None;
-    }
-    let out = std::process::Command::new("hyprctl")
-        .arg(what)
-        .output()
-        .ok()?;
-    out.status
-        .success()
-        .then(|| String::from_utf8_lossy(&out.stdout).to_string())
-}
-
-/// Panel layout of the Omarchy bar. Omarchy 4 renders the bar in QML, so this
-/// reads the shell plugin manifest rather than a waybar config.
-pub(crate) fn bar_panels() -> Vec<String> {
-    let manifest = "/usr/share/omarchy/shell/plugins/bar/manifest.json";
-    let Ok(text) = std::fs::read_to_string(manifest) else {
-        return vec!["bar plugin manifest not found".to_string()];
-    };
-    let widgets = super::fs::list_dir("/usr/share/omarchy/shell/plugins/bar/widgets");
-    let names: Vec<String> = widgets
-        .iter()
-        .filter_map(|p| p.file_name()?.to_str())
-        .filter(|n| n.ends_with(".qml"))
-        .map(|n| n.trim_end_matches(".qml").to_string())
-        .collect();
-    if names.is_empty() {
-        vec![format!("qml bar ({} bytes of manifest)", text.len())]
-    } else {
-        vec![format!("qml bar widgets: {}", names.join(", "))]
-    }
 }
 
 #[cfg(test)]
@@ -215,7 +182,7 @@ Monitor DP-2 (DP-2 3440x1440) (0x1f) at 2560x140:
     #[test]
     fn parse_monitors_keeps_a_value_that_contains_commas() {
         let rows = parse_monitors(MONITORS);
-        assert!(field(&rows, "availableModes").unwrap().contains(','));
+        assert!(field(&rows, "availableModes").expect("modes").contains(','));
     }
 
     #[test]
@@ -268,13 +235,46 @@ Monitor DP-2 (DP-2 3440x1440) (0x1f) at 2560x140:
         assert!(parse_monitors("\n\n   \n").is_empty());
     }
 
-    // ---- live ------------------------------------------------------------
+    #[test]
+    fn a_monitor_serial_is_an_identifier() {
+        let rows = parse_monitors(MONITORS);
+
+        assert!(rows.contains(&Row::identifier("serial", "ABC123")));
+    }
+
+    // ---- workspaces and windows ---------------------------------------------
 
     #[test]
-    fn rows_and_bar_panels_render_without_panicking() {
-        let rows = rows();
-        let text: String = rows.iter().map(|r| format!("{r:?}")).collect();
-        assert!(!text.contains("NaN"), "{text}");
-        assert!(!bar_panels().is_empty());
+    fn only_regular_workspaces_are_counted() {
+        let out = "\
+workspace ID 1 (1) on monitor eDP-1:
+	windows: 2
+workspace ID 3 (3) on monitor eDP-1:
+	windows: 1
+workspace ID -98 (special:magic) on monitor eDP-1:
+	windows: 0
+";
+        assert_eq!(count_workspaces(out), 2);
+        assert_eq!(count_workspaces(""), 0);
+    }
+
+    #[test]
+    fn the_window_title_is_read_and_an_empty_one_is_none() {
+        assert_eq!(
+            window_title("Window 5 -> kitty:\n\tclass: kitty\n\ttitle: ~/src: vim\n").as_deref(),
+            Some("~/src: vim")
+        );
+        assert_eq!(window_title("Invalid\n"), None);
+        assert_eq!(window_title("\ttitle: \n"), None);
+    }
+
+    #[test]
+    fn without_hyprland_the_section_says_so() {
+        let fx = crate::collect::fixture::Fixture::new();
+
+        assert_eq!(
+            rows(&fx.host()),
+            [Row::note("Hyprland not reachable (not running Hyprland?)")]
+        );
     }
 }
