@@ -8,7 +8,7 @@ use crate::collect::{Row, Section};
 use crate::error::Result;
 
 /// Print the whole report, for piping into a file or a bug report.
-pub fn print() -> Result<()> {
+pub(crate) fn print() -> Result<()> {
     let mut app = App::new();
     // CPU usage is a delta between two reads, so give it a moment to happen.
     if !app.stats.primed() {

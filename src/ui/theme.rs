@@ -6,16 +6,16 @@
 use crate::term::Color;
 
 #[derive(Clone)]
-pub struct Palette {
-    pub accent: Color,
-    pub background: Color,
-    pub foreground: Color,
-    pub muted: Color,
-    pub heading: Color,
-    pub red: Color,
-    pub yellow: Color,
-    pub green: Color,
-    pub selection: Color,
+pub(crate) struct Palette {
+    pub(crate) accent: Color,
+    pub(crate) background: Color,
+    pub(crate) foreground: Color,
+    pub(crate) muted: Color,
+    pub(crate) heading: Color,
+    pub(crate) red: Color,
+    pub(crate) yellow: Color,
+    pub(crate) green: Color,
+    pub(crate) selection: Color,
 }
 
 impl Default for Palette {
@@ -36,7 +36,7 @@ impl Default for Palette {
 
 impl Palette {
     /// Read the theme Omarchy says is current, falling back to a dark default.
-    pub fn from_omarchy() -> Palette {
+    pub(crate) fn from_omarchy() -> Palette {
         let mut palette = Palette::default();
 
         let theme_name = std::fs::read_to_string(
@@ -143,7 +143,7 @@ fn hex(value: &str) -> Option<Color> {
 }
 
 /// Cool while low, warm when hot, so a glance at a bar tells you the level.
-pub fn heat(fraction: f64, palette: &Palette) -> Color {
+pub(crate) fn heat(fraction: f64, palette: &Palette) -> Color {
     match fraction {
         f if f < 0.5 => palette.green,
         f if f < 0.75 => palette.yellow,

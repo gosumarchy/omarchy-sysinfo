@@ -7,7 +7,7 @@ use std::path::Path;
 
 /// Every DRM connector tells us which display outputs the GPU drives, and the
 /// GPU itself comes from the `/sys/class/drm/cardN/device` symlink.
-pub fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     let drm = Path::new("/sys/class/drm");
     let mut rows = Vec::new();
 

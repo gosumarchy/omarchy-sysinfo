@@ -6,22 +6,22 @@
 //! [`units`] for formatting the numbers inside them. The types they all speak —
 //! [`Bar`], [`Row`] and [`Section`] — live here.
 
-pub mod cpu;
-pub mod display;
-pub mod dmi;
-pub mod fs;
-pub mod gpu;
-pub mod omarchy;
-pub mod pci;
-pub mod power;
-pub mod sensors;
-pub mod stats;
-pub mod storage;
-pub mod system;
-pub mod units;
-pub mod usb;
+pub(crate) mod cpu;
+pub(crate) mod display;
+pub(crate) mod dmi;
+pub(crate) mod fs;
+pub(crate) mod gpu;
+pub(crate) mod omarchy;
+pub(crate) mod pci;
+pub(crate) mod power;
+pub(crate) mod sensors;
+pub(crate) mod stats;
+pub(crate) mod storage;
+pub(crate) mod system;
+pub(crate) mod units;
+pub(crate) mod usb;
 
-pub use stats::Stats;
+pub(crate) use stats::Stats;
 
 /// A bar rendered next to a value, e.g. CPU usage or a temperature.
 ///
@@ -30,7 +30,7 @@ pub use stats::Stats;
 /// say that on its own: it admits `NaN`, and `clamp` passes `NaN` straight
 /// through because it is neither above the max nor below the min.
 #[derive(Clone, Debug, PartialEq)]
-pub struct Bar {
+pub(crate) struct Bar {
     frac: f64,
 }
 
@@ -39,7 +39,7 @@ impl Bar {
     ///
     /// `NaN` is pinned to `0.0` and infinities clamp to the ends, so a collector
     /// that divided by a zero total cannot produce a literal "NaN%" bar.
-    pub fn new(frac: f64) -> Bar {
+    pub(crate) fn new(frac: f64) -> Bar {
         let frac = if frac.is_nan() {
             0.0
         } else {
@@ -50,14 +50,14 @@ impl Bar {
     }
 
     /// The filled fraction, always within `0.0..=1.0`.
-    pub fn frac(&self) -> f64 {
+    pub(crate) fn frac(&self) -> f64 {
         self.frac
     }
 }
 
 /// One line of a section's body.
 #[derive(Clone, Debug, PartialEq)]
-pub enum Row {
+pub(crate) enum Row {
     /// Small sub-heading that groups the fields below it.
     Header(String),
     /// A `label  value` pair, optionally with a usage bar.
@@ -73,7 +73,7 @@ pub enum Row {
 
 impl Row {
     /// A plain `label  value` row with no bar.
-    pub fn field(label: impl Into<String>, value: impl Into<String>) -> Row {
+    pub(crate) fn field(label: impl Into<String>, value: impl Into<String>) -> Row {
         Row::Field {
             label: label.into(),
             value: value.into(),
@@ -82,7 +82,7 @@ impl Row {
     }
 
     /// A row carrying a usage bar, built from a raw ratio that gets clamped.
-    pub fn field_with(label: impl Into<String>, value: impl Into<String>, frac: f64) -> Row {
+    pub(crate) fn field_with(label: impl Into<String>, value: impl Into<String>, frac: f64) -> Row {
         Row::Field {
             label: label.into(),
             value: value.into(),
@@ -91,21 +91,21 @@ impl Row {
     }
 
     /// A dimmed hint for something absent or deliberately skipped.
-    pub fn note(text: impl Into<String>) -> Row {
+    pub(crate) fn note(text: impl Into<String>) -> Row {
         Row::Note(text.into())
     }
 }
 
 /// A named page of the report.
 #[derive(Debug, PartialEq)]
-pub struct Section {
-    pub title: String,
-    pub rows: Vec<Row>,
+pub(crate) struct Section {
+    pub(crate) title: String,
+    pub(crate) rows: Vec<Row>,
 }
 
 impl Section {
     /// Group rows under a heading the UI can page through.
-    pub fn new(title: impl Into<String>, rows: Vec<Row>) -> Section {
+    pub(crate) fn new(title: impl Into<String>, rows: Vec<Row>) -> Section {
         Section {
             title: title.into(),
             rows,

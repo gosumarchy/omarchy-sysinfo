@@ -15,7 +15,7 @@ fn cpuinfo() -> String {
 }
 
 /// The name of the socket, e.g. `Ulysses-S`.
-pub fn brand() -> String {
+pub(crate) fn brand() -> String {
     parse_brand(&cpuinfo())
 }
 
@@ -31,7 +31,7 @@ fn parse_brand(cpuinfo: &str) -> String {
     "unknown CPU".to_string()
 }
 
-pub fn rows(stats: &mut Stats) -> Vec<Row> {
+pub(crate) fn rows(stats: &mut Stats) -> Vec<Row> {
     let mut rows = vec![
         Row::field("Model", brand()),
         Row::field(

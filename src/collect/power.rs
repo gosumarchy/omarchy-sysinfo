@@ -5,7 +5,7 @@ use super::{
 };
 use std::path::Path;
 
-pub fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     let mut rows = Vec::new();
     let supplies = super::fs::list_dir("/sys/class/power_supply");
 
@@ -209,7 +209,7 @@ fn thresholds() -> Option<Vec<(String, String)>> {
 }
 
 /// Everything the overview badge needs from this module.
-pub fn summary() -> (String, String) {
+pub(crate) fn summary() -> (String, String) {
     // Looking for BAT0 by name made the badge say "no battery" on a machine
     // whose only battery is called BAT1.
     let Some(bat) = battery() else {

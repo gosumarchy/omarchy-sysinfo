@@ -23,7 +23,7 @@ use std::sync::OnceLock;
 /// The result is already trimmed, and a file holding only whitespace reads as
 /// `None`. Every parser in this crate relies on that, so it is part of the
 /// contract rather than an accident of the implementation.
-pub fn read(path: impl AsRef<Path>) -> Option<String> {
+pub(crate) fn read(path: impl AsRef<Path>) -> Option<String> {
     try_read(path).ok().flatten()
 }
 
@@ -32,7 +32,7 @@ pub fn read(path: impl AsRef<Path>) -> Option<String> {
 /// `Ok(None)` means the path is not there, or is there but empty. `Err(_)` means
 /// it is there and reading it failed — a permission problem, a directory, a
 /// dangling symlink.
-pub fn try_read(path: impl AsRef<Path>) -> std::io::Result<Option<String>> {
+pub(crate) fn try_read(path: impl AsRef<Path>) -> std::io::Result<Option<String>> {
     match std::fs::read_to_string(path) {
         Ok(raw) => {
             let trimmed = raw.trim();
@@ -49,12 +49,12 @@ pub fn try_read(path: impl AsRef<Path>) -> std::io::Result<Option<String>> {
 }
 
 /// Read a float, e.g. a temperature in millidegrees or a load average.
-pub fn read_f64(path: impl AsRef<Path>) -> Option<f64> {
+pub(crate) fn read_f64(path: impl AsRef<Path>) -> Option<f64> {
     read(path).and_then(|s| s.parse().ok())
 }
 
 /// Raw bytes, for files that are not text. An empty file is absence.
-pub fn read_bytes(path: impl AsRef<Path>) -> Option<Vec<u8>> {
+pub(crate) fn read_bytes(path: impl AsRef<Path>) -> Option<Vec<u8>> {
     let bytes = std::fs::read(path).ok()?;
     (!bytes.is_empty()).then_some(bytes)
 }
@@ -64,7 +64,7 @@ pub fn read_bytes(path: impl AsRef<Path>) -> Option<Vec<u8>> {
 /// Parsed straight to `u64` rather than through [`read_f64`]: a value that is not
 /// a whole number is unavailable, not zero, and an `f64` would quietly round off
 /// anything above 2^53.
-pub fn read_u64(path: impl AsRef<Path>) -> Option<u64> {
+pub(crate) fn read_u64(path: impl AsRef<Path>) -> Option<u64> {
     read(path).and_then(|s| s.parse().ok())
 }
 
@@ -72,7 +72,7 @@ pub fn read_u64(path: impl AsRef<Path>) -> Option<u64> {
 ///
 /// A directory that cannot be listed reads as empty, matching how the callers
 /// treat a path that is not there.
-pub fn list_dir(path: impl AsRef<Path>) -> Vec<PathBuf> {
+pub(crate) fn list_dir(path: impl AsRef<Path>) -> Vec<PathBuf> {
     let mut out: Vec<_> = std::fs::read_dir(path)
         .into_iter()
         .flatten()
@@ -86,7 +86,7 @@ pub fn list_dir(path: impl AsRef<Path>) -> Vec<PathBuf> {
 }
 
 /// Last path component of a `/sys` symlink target that we read as a string.
-pub fn basename(path: &str) -> String {
+pub(crate) fn basename(path: &str) -> String {
     path.rsplit('/')
         .find(|s| !s.is_empty())
         .unwrap_or(path)
@@ -95,20 +95,20 @@ pub fn basename(path: &str) -> String {
 
 /// `sysfs` exposes bound drivers as symlinks to `/sys/bus/pci/drivers/i915`,
 /// which cannot be read as a file. This resolves one to its name.
-pub fn driver_name(link: impl AsRef<Path>) -> Option<String> {
+pub(crate) fn driver_name(link: impl AsRef<Path>) -> Option<String> {
     let target = std::fs::read_link(link).ok()?;
 
     Some(basename(&target.to_string_lossy()))
 }
 
 /// The kernel command line. It does not change until reboot.
-pub fn cmdline() -> Option<String> {
+pub(crate) fn cmdline() -> Option<String> {
     static CACHED: OnceLock<Option<String>> = OnceLock::new();
     CACHED.get_or_init(|| read("/proc/cmdline")).clone()
 }
 
 /// The value the kernel was booted with for one `key=` on the command line.
-pub fn kernel_param(key: &str) -> Option<String> {
+pub(crate) fn kernel_param(key: &str) -> Option<String> {
     let cmdline = cmdline()?;
     let prefix = format!("{key}=");
     cmdline

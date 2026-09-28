@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 /// Resolve `0x8086:0x9a49` into `Intel Corporation Meteor Lake-P [Intel Arc Graphics]`
 /// using the system `pci.ids` database when one is installed.
-pub fn device_name(vendor: &str, device: &str) -> Option<String> {
+pub(crate) fn device_name(vendor: &str, device: &str) -> Option<String> {
     let vendor_id = parse_hex_id(vendor)?;
     let device_id = parse_hex_id(device)?;
     let db = ids();
@@ -18,7 +18,7 @@ pub fn device_name(vendor: &str, device: &str) -> Option<String> {
     Some(format!("{vendor_name} {device_name}"))
 }
 
-pub fn vendor_name(vendor: &str) -> Option<String> {
+pub(crate) fn vendor_name(vendor: &str) -> Option<String> {
     let id = parse_hex_id(vendor)?;
     ids().vendors.get(&id).cloned()
 }
@@ -131,7 +131,7 @@ fn parse_ids(text: &str) -> Ids {
     Ids { vendors, devices }
 }
 
-pub fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     let devices = super::fs::list_dir("/sys/bus/pci/devices");
     if devices.is_empty() {
         return vec![Row::note("no pci bus")];
@@ -170,7 +170,7 @@ pub fn rows() -> Vec<Row> {
 ///
 /// The domain is not assumed to be zero: a system can put a device behind
 /// another domain, and a hardcoded `0000:` prefix missed it.
-pub fn pci_slot_of(path: &Path) -> Option<String> {
+pub(crate) fn pci_slot_of(path: &Path) -> Option<String> {
     let resolved = std::fs::canonicalize(path).ok()?;
     resolved
         .components()

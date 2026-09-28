@@ -9,7 +9,7 @@
 ///
 /// The unit table stops at TiB, so a value beyond that keeps counting up in TiB
 /// rather than wrapping or looping forever.
-pub fn human_bytes(bytes: u64) -> String {
+pub(crate) fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
 
     if bytes < 1024 {
@@ -28,7 +28,7 @@ pub fn human_bytes(bytes: u64) -> String {
 }
 
 /// A clock speed, switching to GHz at 1000 MHz.
-pub fn human_mhz(mhz: u64) -> String {
+pub(crate) fn human_mhz(mhz: u64) -> String {
     if mhz >= 1000 {
         format!("{:.2} GHz", mhz as f64 / 1000.0)
     } else {
@@ -37,7 +37,7 @@ pub fn human_mhz(mhz: u64) -> String {
 }
 
 /// Battery energy, which the kernel reports in micro-watt-hours rather than bytes.
-pub fn human_energy(uwh: u64) -> String {
+pub(crate) fn human_energy(uwh: u64) -> String {
     let wh = uwh as f64 / 1_000_000.0;
 
     if wh >= 1000.0 {
@@ -48,7 +48,7 @@ pub fn human_energy(uwh: u64) -> String {
 }
 
 /// Power draw in watts, promoting to kilowatts past 1000 W.
-pub fn human_watts(uw: u64) -> String {
+pub(crate) fn human_watts(uw: u64) -> String {
     let w = uw as f64 / 1_000_000.0;
 
     if w >= 1000.0 {
@@ -59,7 +59,7 @@ pub fn human_watts(uw: u64) -> String {
 }
 
 /// A duration, showing only the two largest units that are non-zero.
-pub fn human_secs(secs: u64) -> String {
+pub(crate) fn human_secs(secs: u64) -> String {
     let d = secs / 86_400;
     let h = (secs % 86_400) / 3_600;
     let m = (secs % 3_600) / 60;
@@ -76,7 +76,7 @@ pub fn human_secs(secs: u64) -> String {
 
 /// Stand in for a value the machine did not report, so a row keeps its shape and
 /// the reader can see that something was looked for and not found.
-pub fn dash(value: Option<String>) -> String {
+pub(crate) fn dash(value: Option<String>) -> String {
     value.unwrap_or_else(|| "-".to_string())
 }
 

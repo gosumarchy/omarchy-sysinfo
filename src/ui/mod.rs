@@ -1,4 +1,4 @@
-pub mod theme;
+pub(crate) mod theme;
 
 use crate::app::{App, Focus};
 use crate::collect::{Bar, Row};
@@ -10,7 +10,7 @@ fn sidebar_width(width: u16) -> u16 {
     (width / 3).clamp(12, 24)
 }
 
-pub fn draw(buffer: &mut Buffer, app: &App, palette: &Palette) {
+pub(crate) fn draw(buffer: &mut Buffer, app: &App, palette: &Palette) {
     let width = buffer.width();
     let height = buffer.height();
     if width < 20 || height < 6 {

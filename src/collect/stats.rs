@@ -30,29 +30,29 @@ impl Times {
 }
 
 #[derive(Clone, Copy, Default)]
-pub struct Memory {
-    pub total: u64,
-    pub available: u64,
-    pub free: u64,
-    pub cached: u64,
-    pub buffers: u64,
-    pub swap_total: u64,
-    pub swap_free: u64,
-    pub huge_pages_total: u64,
-    pub huge_pages_free: u64,
-    pub swap_devices: usize,
+pub(crate) struct Memory {
+    pub(crate) total: u64,
+    pub(crate) available: u64,
+    pub(crate) free: u64,
+    pub(crate) cached: u64,
+    pub(crate) buffers: u64,
+    pub(crate) swap_total: u64,
+    pub(crate) swap_free: u64,
+    pub(crate) huge_pages_total: u64,
+    pub(crate) huge_pages_free: u64,
+    pub(crate) swap_devices: usize,
 }
 
 impl Memory {
-    pub fn used(&self) -> u64 {
+    pub(crate) fn used(&self) -> u64 {
         self.total.saturating_sub(self.available)
     }
 
-    pub fn swap_used(&self) -> u64 {
+    pub(crate) fn swap_used(&self) -> u64 {
         self.swap_total.saturating_sub(self.swap_free)
     }
 
-    pub fn rows(&self) -> Vec<Row> {
+    pub(crate) fn rows(&self) -> Vec<Row> {
         let mut rows = vec![Row::Header("Memory".into())];
         rows.push(Row::field_with(
             "Physical",
@@ -156,7 +156,7 @@ fn fraction(part: u64, whole: u64) -> f64 {
 }
 
 /// Everything that has to be sampled over time to show a live figure.
-pub struct Stats {
+pub(crate) struct Stats {
     prev_total: Times,
     prev_cores: Vec<Times>,
     per_core: Vec<f64>,
@@ -175,7 +175,7 @@ pub struct Stats {
 const MIN_INTERVAL: Duration = Duration::from_millis(100);
 
 impl Stats {
-    pub fn new() -> Stats {
+    pub(crate) fn new() -> Stats {
         let mut stats = Stats {
             prev_total: Times::default(),
             prev_cores: Vec::new(),
@@ -195,12 +195,12 @@ impl Stats {
 
     /// Whether per-core usage is a real measurement yet, as opposed to a
     /// placeholder for reads that were too close together to mean anything.
-    pub fn primed(&self) -> bool {
+    pub(crate) fn primed(&self) -> bool {
         self.primed
     }
 
     /// Re-read `/proc/stat`, `/proc/meminfo`, `/proc/uptime` and `/proc/loadavg`.
-    pub fn sample(&mut self) {
+    pub(crate) fn sample(&mut self) {
         // Usage is a difference between two reads, so it is only meaningful
         // once enough wall-clock time has passed for the counters to move.
         // Back-to-back reads would otherwise report a confident zero.
@@ -244,42 +244,42 @@ impl Stats {
         }
     }
 
-    pub fn cpu_usage(&self) -> f64 {
+    pub(crate) fn cpu_usage(&self) -> f64 {
         if self.per_core.is_empty() {
             return 0.0;
         }
         self.per_core.iter().sum::<f64>() / self.per_core.len() as f64
     }
 
-    pub fn per_core(&self) -> &[f64] {
+    pub(crate) fn per_core(&self) -> &[f64] {
         &self.per_core
     }
 
-    pub fn core_names(&self) -> &[String] {
+    pub(crate) fn core_names(&self) -> &[String] {
         &self.core_names
     }
 
-    pub fn memory(&self) -> Memory {
+    pub(crate) fn memory(&self) -> Memory {
         self.memory
     }
 
-    pub fn uptime(&self) -> u64 {
+    pub(crate) fn uptime(&self) -> u64 {
         self.uptime
     }
 
-    pub fn load(&self) -> (f64, f64, f64) {
+    pub(crate) fn load(&self) -> (f64, f64, f64) {
         self.load
     }
 
     /// How many threads are runnable right now, and total threads.
-    pub fn process_load(&self) -> String {
+    pub(crate) fn process_load(&self) -> String {
         let (running, total) = self.runnable;
         format!("{running} runnable / {total} threads")
     }
 
     /// The kernel's own idle ratio since boot, from the aggregate `cpu` line
     /// `sample` already parsed.
-    pub fn idle_since_boot(&self) -> Option<f64> {
+    pub(crate) fn idle_since_boot(&self) -> Option<f64> {
         if self.prev_total.total == 0 {
             return None;
         }

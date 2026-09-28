@@ -5,7 +5,7 @@ use super::{
 };
 use std::path::Path;
 
-pub fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     let mounts = mount_table();
     let usage = usage_table();
     let mut rows = Vec::new();

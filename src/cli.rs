@@ -3,7 +3,7 @@
 use crate::error::Result;
 use crate::report;
 
-pub const HELP: &str = "\
+pub(crate) const HELP: &str = "\
 omarchy-sysinfo — describe this machine
 
 usage: omarchy-sysinfo [--plain]
@@ -30,7 +30,7 @@ enum Action {
 /// `None` means "no arguments, carry on", which is the only case the caller has
 /// to think about; everything else is already finished by the time this
 /// returns.
-pub fn handle_args() -> Option<Result<()>> {
+pub(crate) fn handle_args() -> Option<Result<()>> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match parse_args(&args) {
         Action::Tui => None,

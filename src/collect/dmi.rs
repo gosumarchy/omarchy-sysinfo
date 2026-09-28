@@ -23,7 +23,7 @@ const FIELDS: &[(&str, &str)] = &[
     ("firmware_version", "Firmware version"),
 ];
 
-pub fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     static CACHED: OnceLock<Vec<Row>> = OnceLock::new();
     CACHED.get_or_init(load_rows).clone()
 }
@@ -160,7 +160,7 @@ fn efi_text_from(raw: &[u8]) -> Option<String> {
 }
 
 /// Human name of the chassis type, e.g. `10` means Notebook.
-pub fn chassis() -> String {
+pub(crate) fn chassis() -> String {
     let Some(code) =
         read(Path::new("/sys/class/dmi/id/chassis_type")).and_then(|v| v.parse::<u8>().ok())
     else {

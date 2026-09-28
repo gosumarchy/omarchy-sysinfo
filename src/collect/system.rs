@@ -7,7 +7,7 @@ use super::{
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-pub fn rows(stats: &mut Stats) -> Vec<Row> {
+pub(crate) fn rows(stats: &mut Stats) -> Vec<Row> {
     let os_release = read("/etc/os-release").unwrap_or_default();
     let name = os_release_field(&os_release, "PRETTY_NAME")
         .or_else(|| os_release_field(&os_release, "NAME"))
@@ -165,26 +165,26 @@ fn container() -> &'static str {
 }
 
 /// Host name, or a placeholder inside an unusual session.
-pub fn hostname() -> String {
+pub(crate) fn hostname() -> String {
     dash(read("/proc/sys/kernel/hostname"))
 }
 
-pub fn distro() -> String {
+pub(crate) fn distro() -> String {
     let os_release = read("/etc/os-release").unwrap_or_default();
     os_release_field(&os_release, "PRETTY_NAME")
         .or_else(|| os_release_field(&os_release, "NAME"))
         .unwrap_or_else(|| "Linux".into())
 }
 
-pub fn kernel() -> String {
+pub(crate) fn kernel() -> String {
     dash(read("/proc/sys/kernel/osrelease"))
 }
 
-pub fn arch() -> String {
+pub(crate) fn arch() -> String {
     std::env::consts::ARCH.to_string()
 }
 
-pub fn timezone() -> String {
+pub(crate) fn timezone() -> String {
     read("/etc/timezone")
         .or_else(|| {
             std::fs::read_link("/etc/localtime")
@@ -202,7 +202,7 @@ pub fn timezone() -> String {
 /// Seconds since the epoch the kernel recorded for this boot.
 ///
 /// `btime` does not move, so the `/proc/stat` read happens once.
-pub fn boot_epoch() -> u64 {
+pub(crate) fn boot_epoch() -> u64 {
     static CACHED: OnceLock<u64> = OnceLock::new();
     *CACHED.get_or_init(|| {
         read("/proc/stat")

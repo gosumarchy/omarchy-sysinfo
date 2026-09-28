@@ -5,7 +5,7 @@ use std::sync::OnceLock;
 
 const SHARE: &str = "/usr/share/omarchy";
 
-pub fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     let mut rows = vec![
         Row::Header("Release".into()),
         Row::field("Version", version()),
@@ -85,7 +85,7 @@ fn home() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/root".into()))
 }
 
-pub fn version() -> String {
+pub(crate) fn version() -> String {
     static CACHED: OnceLock<String> = OnceLock::new();
     CACHED
         .get_or_init(|| {
@@ -107,7 +107,7 @@ pub fn version() -> String {
         .clone()
 }
 
-pub fn channel() -> String {
+pub(crate) fn channel() -> String {
     static CACHED: OnceLock<String> = OnceLock::new();
     CACHED
         .get_or_init(|| run("omarchy-channel-current", &[]).unwrap_or_else(|| "unknown".into()))
@@ -250,7 +250,7 @@ fn prompt() -> String {
         .unwrap_or_else(|| "-".into())
 }
 
-pub fn theme() -> String {
+pub(crate) fn theme() -> String {
     let name = read(home().join(".local/state/omarchy/current/theme.name"))
         .unwrap_or_else(|| "unknown".into());
     let colors = Path::new(SHARE)
@@ -456,7 +456,7 @@ fn apps() -> Vec<String> {
     names
 }
 
-pub fn summary() -> (String, String) {
+pub(crate) fn summary() -> (String, String) {
     (theme(), channel())
 }
 

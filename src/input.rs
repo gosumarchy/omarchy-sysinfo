@@ -12,7 +12,7 @@ use std::time::Duration;
 const MAX_PENDING: usize = 4096;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Key {
+pub(crate) enum Key {
     Char(char),
     Up,
     Down,
@@ -188,7 +188,7 @@ impl InputBuffer {
 }
 
 /// Spawn the reader thread. It exits when stdin closes.
-pub fn spawn() -> Receiver<Key> {
+pub(crate) fn spawn() -> Receiver<Key> {
     let (tx, rx) = mpsc::channel();
     std::thread::spawn(move || {
         let mut stdin = std::io::stdin();
@@ -239,7 +239,7 @@ fn utf8_len(first: u8) -> usize {
 ///
 /// A held key repeats faster than a collect finishes, so the channel fills
 /// with refreshes and `q` sits behind them until each one has blocked.
-pub fn coalesce_refresh(key: Key, rx: &Receiver<Key>) -> Vec<Key> {
+pub(crate) fn coalesce_refresh(key: Key, rx: &Receiver<Key>) -> Vec<Key> {
     if key != Key::Char('r') {
         return vec![key];
     }
@@ -254,7 +254,7 @@ pub fn coalesce_refresh(key: Key, rx: &Receiver<Key>) -> Vec<Key> {
 }
 
 /// Wait for a key, giving up after `timeout` so the caller can refresh.
-pub fn next_key(rx: &Receiver<Key>, timeout: Duration) -> Option<Key> {
+pub(crate) fn next_key(rx: &Receiver<Key>, timeout: Duration) -> Option<Key> {
     match rx.recv_timeout(timeout) {
         Ok(key) => Some(key),
         Err(RecvTimeoutError::Timeout) => None,

@@ -9,7 +9,7 @@ use std::process::Command;
 use crate::collect::Bar;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Color {
+pub(crate) enum Color {
     Default,
     Rgb(u8, u8, u8),
 }
@@ -39,15 +39,15 @@ impl Color {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct Style {
-    pub fg: Color,
-    pub bg: Color,
-    pub bold: bool,
-    pub dim: bool,
+pub(crate) struct Style {
+    pub(crate) fg: Color,
+    pub(crate) bg: Color,
+    pub(crate) bold: bool,
+    pub(crate) dim: bool,
 }
 
 impl Style {
-    pub fn new(fg: Color) -> Style {
+    pub(crate) fn new(fg: Color) -> Style {
         Style {
             fg,
             bg: Color::Default,
@@ -56,17 +56,17 @@ impl Style {
         }
     }
 
-    pub fn on(mut self, bg: Color) -> Style {
+    pub(crate) fn on(mut self, bg: Color) -> Style {
         self.bg = bg;
         self
     }
 
-    pub fn bold(mut self) -> Style {
+    pub(crate) fn bold(mut self) -> Style {
         self.bold = true;
         self
     }
 
-    pub fn dim(mut self) -> Style {
+    pub(crate) fn dim(mut self) -> Style {
         self.dim = true;
         self
     }
@@ -79,14 +79,14 @@ struct Cell {
 }
 
 /// A grid of styled characters that we render in one pass.
-pub struct Buffer {
+pub(crate) struct Buffer {
     width: u16,
     height: u16,
     cells: Vec<Cell>,
 }
 
 impl Buffer {
-    pub fn new(width: u16, height: u16, blank: Style) -> Buffer {
+    pub(crate) fn new(width: u16, height: u16, blank: Style) -> Buffer {
         Buffer {
             width,
             height,
@@ -100,16 +100,16 @@ impl Buffer {
         }
     }
 
-    pub fn width(&self) -> u16 {
+    pub(crate) fn width(&self) -> u16 {
         self.width
     }
 
-    pub fn height(&self) -> u16 {
+    pub(crate) fn height(&self) -> u16 {
         self.height
     }
 
     /// Draw `text` at `x,y`, clipped to the buffer. Returns the x after the text.
-    pub fn put(&mut self, x: u16, y: u16, text: &str, style: Style) -> u16 {
+    pub(crate) fn put(&mut self, x: u16, y: u16, text: &str, style: Style) -> u16 {
         if y >= self.height {
             return x;
         }
@@ -125,7 +125,7 @@ impl Buffer {
     }
 
     /// Draw `text` right-aligned so it ends at `x` (exclusive).
-    pub fn put_right(&mut self, x: u16, y: u16, text: &str, style: Style) {
+    pub(crate) fn put_right(&mut self, x: u16, y: u16, text: &str, style: Style) {
         let len = text.chars().count() as u16;
         if len >= x {
             return;
@@ -133,7 +133,7 @@ impl Buffer {
         self.put(x - len, y, text, style);
     }
 
-    pub fn fill_row(&mut self, y: u16, ch: char, style: Style) {
+    pub(crate) fn fill_row(&mut self, y: u16, ch: char, style: Style) {
         if y >= self.height {
             return;
         }
@@ -156,7 +156,7 @@ impl Buffer {
     }
 
     /// Horizontal rule across `x..end` on row `y`.
-    pub fn hline(&mut self, x: u16, y: u16, end: u16, ch: char, style: Style) {
+    pub(crate) fn hline(&mut self, x: u16, y: u16, end: u16, ch: char, style: Style) {
         let mut cursor = x;
         while cursor < end && cursor < self.width {
             self.set(cursor, y, ch, style);
@@ -165,7 +165,7 @@ impl Buffer {
     }
 
     /// Vertical rule down column `x` from `y` to `y_end`.
-    pub fn vline(&mut self, x: u16, y: u16, y_end: u16, ch: char, style: Style) {
+    pub(crate) fn vline(&mut self, x: u16, y: u16, y_end: u16, ch: char, style: Style) {
         let mut row = y;
         while row < y_end && row < self.height {
             self.set(x, row, ch, style);
@@ -177,7 +177,15 @@ impl Buffer {
     ///
     /// The clamp lives in `Bar::new`, so this cannot be handed a ratio outside
     /// `0.0..=1.0` and does not repeat the check.
-    pub fn gauge(&mut self, x: u16, y: u16, width: u16, bar: Bar, style: Style, empty: Style) {
+    pub(crate) fn gauge(
+        &mut self,
+        x: u16,
+        y: u16,
+        width: u16,
+        bar: Bar,
+        style: Style,
+        empty: Style,
+    ) {
         let filled = ((bar.frac() * width as f64).round() as u16).min(width);
         for offset in 0..width {
             let ch = if offset < filled { '█' } else { '░' };
@@ -191,7 +199,7 @@ impl Buffer {
     }
 
     /// Serialise to a string of ANSI escapes, skipping runs of equal style.
-    pub fn render(&self) -> String {
+    pub(crate) fn render(&self) -> String {
         let mut out = String::with_capacity(self.cells.len() * 8);
         out.push_str("\x1b[H");
         let mut current: Option<Style> = None;
@@ -230,13 +238,13 @@ impl Buffer {
 }
 
 /// Owns raw mode for the lifetime of the program and restores it on drop.
-pub struct Terminal {
+pub(crate) struct Terminal {
     saved_stty: Option<String>,
     size: (u16, u16),
 }
 
 impl Terminal {
-    pub fn enter() -> io::Result<Terminal> {
+    pub(crate) fn enter() -> io::Result<Terminal> {
         let saved_stty = stty(&["-g"]);
         // Raw mode with no echo; the shell is restored on the way out.
         let _ = stty(&["raw", "-echo"]);
@@ -247,15 +255,15 @@ impl Terminal {
         Ok(Terminal { saved_stty, size })
     }
 
-    pub fn size(&self) -> (u16, u16) {
+    pub(crate) fn size(&self) -> (u16, u16) {
         self.size
     }
 
-    pub fn refresh_size(&mut self) {
+    pub(crate) fn refresh_size(&mut self) {
         self.size = terminal_size();
     }
 
-    pub fn draw(&mut self, buffer: &Buffer) -> io::Result<()> {
+    pub(crate) fn draw(&mut self, buffer: &Buffer) -> io::Result<()> {
         let mut out = io::stdout();
         out.write_all(buffer.render().as_bytes())?;
         out.flush()
@@ -287,7 +295,7 @@ fn stty(args: &[&str]) -> Option<String> {
 ///
 /// The ioctl is the path a redraw takes. `stty` stays only for a terminal that
 /// will not answer the syscall, so a resize still cannot fork on every frame.
-pub fn terminal_size() -> (u16, u16) {
+pub(crate) fn terminal_size() -> (u16, u16) {
     for fd in [0, 1] {
         if let Some(size) = ioctl_size(fd) {
             return size;

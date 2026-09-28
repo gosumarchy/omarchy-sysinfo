@@ -5,7 +5,7 @@ use super::{
 };
 use std::path::Path;
 
-pub fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     let devices = super::fs::list_dir("/sys/bus/usb/devices");
     let mut rows = Vec::new();
     let mut devices_seen = Vec::new();
@@ -121,7 +121,7 @@ fn root_hubs() -> Vec<(String, String)> {
 
 /// Wireless chips expose link state through `iw`, which is far more complete
 /// than the sparse `sysfs` wireless directory.
-pub fn wireless() -> Vec<Row> {
+pub(crate) fn wireless() -> Vec<Row> {
     let mut rows = Vec::new();
     let net = Path::new("/sys/class/net");
 

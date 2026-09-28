@@ -4,7 +4,7 @@ use super::{
 };
 use std::collections::BTreeMap;
 
-pub fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     let mut rows = Vec::new();
     let mut grouped: BTreeMap<String, BTreeMap<String, Vec<(String, f64)>>> = BTreeMap::new();
 
@@ -51,7 +51,7 @@ pub fn rows() -> Vec<Row> {
 }
 
 /// Hottest sensor on the machine, in °C, for the overview badge.
-pub fn peak_temperature() -> Option<f64> {
+pub(crate) fn peak_temperature() -> Option<f64> {
     all_readings("temp")
         .into_iter()
         .map(|(_, _, v)| v / 1000.0)
@@ -60,7 +60,7 @@ pub fn peak_temperature() -> Option<f64> {
         })
 }
 
-pub fn all_readings(kind: &str) -> Vec<(String, String, f64)> {
+pub(crate) fn all_readings(kind: &str) -> Vec<(String, String, f64)> {
     let mut out = Vec::new();
     for hwmon in super::fs::list_dir("/sys/class/hwmon") {
         let chip = read(hwmon.join("name")).unwrap_or_else(|| {

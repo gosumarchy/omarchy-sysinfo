@@ -2,7 +2,7 @@ use super::{Row, units::dash};
 
 /// Monitor layout as Hyprland reports it. This is the only source that knows
 /// about scaling, position and refresh rate on a Wayland compositor.
-pub fn rows() -> Vec<Row> {
+pub(crate) fn rows() -> Vec<Row> {
     let Some(out) = hyprctl("monitors") else {
         return vec![Row::note("hyprctl unavailable (not running Hyprland?)")];
     };
@@ -109,7 +109,7 @@ fn hyprctl(what: &str) -> Option<String> {
 
 /// Panel layout of the Omarchy bar. Omarchy 4 renders the bar in QML, so this
 /// reads the shell plugin manifest rather than a waybar config.
-pub fn bar_panels() -> Vec<String> {
+pub(crate) fn bar_panels() -> Vec<String> {
     let manifest = "/usr/share/omarchy/shell/plugins/bar/manifest.json";
     let Ok(text) = std::fs::read_to_string(manifest) else {
         return vec!["bar plugin manifest not found".to_string()];

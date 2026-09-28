@@ -4,7 +4,7 @@ use std::error::Error as StdError;
 use std::fmt;
 use std::io;
 
-pub type Result<T> = std::result::Result<T, Error>;
+pub(crate) type Result<T> = std::result::Result<T, Error>;
 
 /// Everything that can go wrong, as a closed set rather than a
 /// `Box<dyn Error>`.
@@ -12,7 +12,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// Only the terminal can fail, and it can only fail with an I/O error, so a
 /// single variant says all of that: no dynamic dispatch, and the caller can
 /// match on the cause when it decides how to report.
-pub enum Error {
+pub(crate) enum Error {
     Io(io::Error),
 }
 

@@ -3,20 +3,20 @@ use crate::input::Key;
 use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Focus {
+pub(crate) enum Focus {
     Sections,
     Detail,
 }
 
 /// Text filter applied to the detail pane, typed with `/`.
 #[derive(Default)]
-pub struct Filter {
-    pub active: bool,
-    pub query: String,
+pub(crate) struct Filter {
+    pub(crate) active: bool,
+    pub(crate) query: String,
 }
 
 impl Filter {
-    pub fn matches(&self, row: &Row) -> bool {
+    pub(crate) fn matches(&self, row: &Row) -> bool {
         if self.query.is_empty() {
             return true;
         }
@@ -34,25 +34,25 @@ impl Filter {
     }
 }
 
-pub struct App {
-    pub sections: Vec<Section>,
-    pub selected: usize,
-    pub focus: Focus,
-    pub scroll: u16,
-    pub should_quit: bool,
-    pub show_help: bool,
-    pub status: String,
-    pub status_at: Instant,
-    pub filter: Filter,
-    pub last_refresh: Instant,
-    pub refresh_interval: Duration,
-    pub stats: Stats,
-    pub hostname: String,
-    pub kernel: String,
+pub(crate) struct App {
+    pub(crate) sections: Vec<Section>,
+    pub(crate) selected: usize,
+    pub(crate) focus: Focus,
+    pub(crate) scroll: u16,
+    pub(crate) should_quit: bool,
+    pub(crate) show_help: bool,
+    pub(crate) status: String,
+    pub(crate) status_at: Instant,
+    pub(crate) filter: Filter,
+    pub(crate) last_refresh: Instant,
+    pub(crate) refresh_interval: Duration,
+    pub(crate) stats: Stats,
+    pub(crate) hostname: String,
+    pub(crate) kernel: String,
 }
 
 impl App {
-    pub fn new() -> App {
+    pub(crate) fn new() -> App {
         let mut app = App {
             sections: Vec::new(),
             selected: 0,
@@ -75,7 +75,7 @@ impl App {
 
     /// Re-read everything. `/proc` and `/sys` reads are cheap enough to redo
     /// whole, and the only state we must keep is the CPU time series.
-    pub fn collect(&mut self) {
+    pub(crate) fn collect(&mut self) {
         self.stats.sample();
 
         let stats = &mut self.stats;
@@ -109,18 +109,18 @@ impl App {
         self.last_refresh = Instant::now();
     }
 
-    pub fn section(&self) -> &Section {
+    pub(crate) fn section(&self) -> &Section {
         &self.sections[self.selected]
     }
 
-    pub fn select(&mut self, index: usize) {
+    pub(crate) fn select(&mut self, index: usize) {
         if index < self.sections.len() {
             self.selected = index;
             self.scroll = 0;
         }
     }
 
-    pub fn move_by(&mut self, delta: isize) {
+    pub(crate) fn move_by(&mut self, delta: isize) {
         // With no sections loaded there is nowhere to move; `clamp` would
         // panic here because its range would be inverted.
         let Some(last) = self.sections.len().checked_sub(1) else {
@@ -134,7 +134,7 @@ impl App {
     }
 
     /// On the sidebar this changes section; in the detail pane it scrolls.
-    pub fn select_relative(&mut self, delta: isize) {
+    pub(crate) fn select_relative(&mut self, delta: isize) {
         if self.focus == Focus::Sections {
             self.move_by(delta);
         } else {
@@ -142,18 +142,18 @@ impl App {
         }
     }
 
-    pub fn scroll_by(&mut self, delta: isize) {
+    pub(crate) fn scroll_by(&mut self, delta: isize) {
         let max = self.max_scroll();
         let next = self.scroll as isize + delta;
         self.scroll = next.clamp(0, max as isize) as u16;
     }
 
-    pub fn page(&mut self, forward: bool) {
+    pub(crate) fn page(&mut self, forward: bool) {
         self.scroll_by(if forward { 10 } else { -10 });
     }
 
     /// How many rows the filter leaves visible, used for the scroll bounds.
-    pub fn detail_len(&self) -> usize {
+    pub(crate) fn detail_len(&self) -> usize {
         self.section()
             .rows
             .iter()
@@ -161,24 +161,24 @@ impl App {
             .count()
     }
 
-    pub fn max_scroll(&self) -> u16 {
+    pub(crate) fn max_scroll(&self) -> u16 {
         self.detail_len().saturating_sub(1) as u16
     }
 
-    pub fn toggle_focus(&mut self) {
+    pub(crate) fn toggle_focus(&mut self) {
         self.focus = match self.focus {
             Focus::Sections => Focus::Detail,
             Focus::Detail => Focus::Sections,
         };
     }
 
-    pub fn set_status(&mut self, text: &str) {
+    pub(crate) fn set_status(&mut self, text: &str) {
         self.status = text.to_string();
         self.status_at = Instant::now();
     }
 
     /// Called every loop iteration. Returns true when the screen needs redrawing.
-    pub fn tick(&mut self) -> bool {
+    pub(crate) fn tick(&mut self) -> bool {
         let mut dirty = false;
 
         if self.last_refresh.elapsed() >= self.refresh_interval {
@@ -194,7 +194,7 @@ impl App {
         dirty
     }
 
-    pub fn on_key(&mut self, key: Key) {
+    pub(crate) fn on_key(&mut self, key: Key) {
         // Ctrl+C is an exit request wherever it lands, including mid-query:
         // swallowing it inside the filter made the app look hung.
         if key == Key::CtrlC {
