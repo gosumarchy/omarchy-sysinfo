@@ -97,7 +97,15 @@ fn sidebar_pane(
     })
     .dim();
     let sections = app.sections();
-    let visible = usize::from(height.saturating_sub(1));
+    // Rows below the pane's title, `top + 1` up to the row above the footer.
+    let rows = usize::from(height.saturating_sub(1));
+    // When the list does not fit, its last row says how much is missing.
+    let overflow = sections.len() > rows;
+    let visible = if overflow {
+        rows.saturating_sub(1)
+    } else {
+        rows
+    };
     let selected = app.selected();
 
     // Scroll the sidebar so the selection stays on screen.
@@ -124,9 +132,17 @@ fn sidebar_pane(
         }
     }
 
-    if sections.len() > visible {
-        let more = format!("  +{} more", sections.len() - visible);
-        buffer.put(1, top + height, &more, Style::new(palette.muted).dim());
+    // The hint used to be drawn at `top + height`, which is the footer row,
+    // and the footer then painted over it, so it never appeared.
+    if overflow && height >= 2 {
+        let more = format!(" +{} more", sections.len() - visible);
+        let room = usize::from(width.saturating_sub(1));
+        buffer.put(
+            0,
+            top + height - 1,
+            &clip(&more, room),
+            Style::new(palette.muted).dim(),
+        );
     }
 
     buffer.vline(width - 1, top, top + height, '│', border);
@@ -663,6 +679,25 @@ mod tests {
 
         assert!(text.contains("▸ Other"), "{text}");
         assert_eq!(text.matches('▸').count(), 1);
+    }
+
+    #[test]
+    fn a_sidebar_that_does_not_fit_says_how_many_sections_are_hidden() {
+        let sections: Vec<Section> = (0..14)
+            .map(|i| Section::new(format!("Section {i}"), vec![]))
+            .collect();
+        let b = drawn(&app_with(sections, 10), 60, 10);
+
+        // Ten rows: header, title rule, six sections, the hint, the footer.
+        assert!(row(&b, 8).contains("+8 more"), "{:?}", rows(&b));
+        assert!(row(&b, 7).contains("Section 5"), "{:?}", rows(&b));
+    }
+
+    #[test]
+    fn a_sidebar_that_fits_has_no_hint() {
+        let text = rows(&drawn(&app_with(sample(), 24), 80, 24)).concat();
+
+        assert!(!text.contains("more"), "{text}");
     }
 
     #[test]
