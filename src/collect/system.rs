@@ -1,8 +1,8 @@
 use super::stats::Stats;
 use super::{
+    Row,
     fs::read,
     units::{dash, human_secs},
-    Row,
 };
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};

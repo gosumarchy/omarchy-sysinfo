@@ -1,6 +1,6 @@
 use super::{
-    fs::{read, read_f64},
     Row,
+    fs::{read, read_f64},
 };
 use std::collections::BTreeMap;
 

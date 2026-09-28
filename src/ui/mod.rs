@@ -3,7 +3,7 @@ pub mod theme;
 use crate::app::{App, Focus};
 use crate::collect::{Bar, Row};
 use crate::term::{Buffer, Style};
-use theme::{heat, Palette};
+use theme::{Palette, heat};
 
 /// Sidebar width, narrowed on small terminals so the detail pane survives.
 fn sidebar_width(width: u16) -> u16 {

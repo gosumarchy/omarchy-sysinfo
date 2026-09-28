@@ -2,8 +2,8 @@
 //! CPU usage means anything, so `sample()` is called repeatedly over time.
 
 use super::{
-    fs::{read, read_u64},
     Row,
+    fs::{read, read_u64},
 };
 use std::time::{Duration, Instant};
 

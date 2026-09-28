@@ -1,4 +1,4 @@
-use super::{units::dash, Row};
+use super::{Row, units::dash};
 
 /// Monitor layout as Hyprland reports it. This is the only source that knows
 /// about scaling, position and refresh rate on a Wayland compositor.

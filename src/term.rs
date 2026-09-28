@@ -312,7 +312,7 @@ struct Winsize {
 
 const TIOCGWINSZ: c_ulong = 0x5413;
 
-extern "C" {
+unsafe extern "C" {
     fn ioctl(fd: c_int, request: c_ulong, arg: *mut Winsize) -> c_int;
 }
 

@@ -1,7 +1,9 @@
 [package]
 name = "omarchy-sysinfo"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
+# `<[T]>::as_chunks` (efivar decoding) is the newest std API in use.
+rust-version = "1.88"
 description = "A TUI that describes this machine: hardware, OS, boot and Omarchy state"
 license = "MIT"
 repository = "https://github.com/gosumarchy/omarchy-sysinfo"

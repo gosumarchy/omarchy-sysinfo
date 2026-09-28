@@ -1,7 +1,7 @@
 use super::{
+    Row,
     fs::{read, read_u64},
     units::human_bytes,
-    Row,
 };
 use std::path::Path;
 

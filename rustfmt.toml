@@ -1,0 +1,22 @@
+# rustfmt.toml — STABLE-channel options only, so `cargo fmt` on stable emits no warnings.
+# Match `edition` to the repo's Cargo.toml before copying in.
+
+edition = "2024"
+max_width = 100
+# "Default", never "Max": Max one-lines everything that fits under max_width,
+# which the user has rejected as horizontally dense (2026-08-06).
+use_small_heuristics = "Default"
+newline_style = "Unix"
+reorder_imports = true
+reorder_modules = true
+merge_derives = true
+use_field_init_shorthand = true
+use_try_shorthand = true
+remove_nested_parens = true
+
+# Import grouping (external → std → local) is the house style but is a NIGHTLY-only
+# rustfmt feature — listing these on stable prints a warning and skips them. To enforce,
+# run `cargo +nightly fmt` and uncomment:
+# group_imports = "StdExternalCrate"
+# imports_granularity = "Crate"
+# format_code_in_doc_comments = true
