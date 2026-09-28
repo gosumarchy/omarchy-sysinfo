@@ -207,17 +207,35 @@ impl Stats {
 
     /// Re-read `/proc/stat`, `/proc/meminfo`, `/proc/uptime` and `/proc/loadavg`.
     pub(crate) fn sample(&mut self, host: &Host) {
-        // Usage is a difference between two reads, so it is only meaningful
-        // once enough wall-clock time has passed for the counters to move.
-        // Back-to-back reads would otherwise report a confident zero.
+        self.sample_cpu(host);
+
+        self.memory = read_memory(host);
+        self.uptime = host.read("/proc/uptime").map_or(0, |u| parse_uptime(&u));
+        if let Some(loadavg) = host.read("/proc/loadavg") {
+            self.load = parse_loadavg(&loadavg);
+        }
+    }
+
+    /// Usage is a difference between two reads, so it is only meaningful once
+    /// enough wall-clock time has passed for the counters to move.
+    ///
+    /// A read that comes too soon changes nothing: it keeps the last real
+    /// measurement on screen and keeps the old baseline, so the next read
+    /// measures over the whole gap. Zeroing every core instead (as a held
+    /// `r` did) showed a confident 0% as if it had been measured.
+    fn sample_cpu(&mut self, host: &Host) {
         let now = Instant::now();
         let elapsed = self.last_sample.map(|t| now.duration_since(t));
+        if elapsed.is_some_and(|e| e < MIN_INTERVAL) {
+            return;
+        }
+
         let current = host
             .read("/proc/stat")
             .map(|s| parse_cpu_times(&s))
             .unwrap_or_default();
-
-        let measured = elapsed.is_some_and(|e| e >= MIN_INTERVAL);
+        // The very first read has nothing to measure against.
+        let measured = elapsed.is_some();
         self.cores = current
             .cores
             .iter()
@@ -229,12 +247,6 @@ impl Stats {
         self.primed |= measured;
         self.prev = current;
         self.last_sample = Some(now);
-
-        self.memory = read_memory(host);
-        self.uptime = host.read("/proc/uptime").map_or(0, |u| parse_uptime(&u));
-        if let Some(loadavg) = host.read("/proc/loadavg") {
-            self.load = parse_loadavg(&loadavg);
-        }
     }
 
     /// A core's usage since the previous sample, matched by name so an
@@ -912,6 +924,29 @@ Hugepagesize:       2048 kB
         assert_eq!(s.cores()[0].usage, 100.0);
         assert_eq!(s.cores()[1].usage, 0.0);
         assert_eq!(s.cpu_usage(), 50.0);
+    }
+
+    #[test]
+    fn a_sample_too_soon_after_a_measurement_keeps_the_measurement() {
+        // A held `r` re-collects straight away; that used to zero every core
+        // while still claiming to be a measurement.
+        let fx = machine("cpu 0 0 0 0\ncpu0 0 0 0 0\n");
+        let host = fx.host();
+        let mut s = Stats::new(&host);
+        fx.write("proc/stat", "cpu 100 0 0 0\ncpu0 100 0 0 0\n");
+        std::thread::sleep(MIN_INTERVAL);
+        s.sample(&host);
+        assert_eq!(s.cores()[0].usage, 100.0);
+
+        fx.write("proc/stat", "cpu 100 0 0 50\ncpu0 100 0 0 50\n");
+        s.sample(&host);
+        assert!(s.primed());
+        assert_eq!(s.cores()[0].usage, 100.0, "the reading must survive");
+
+        // The next real sample measures from the last kept baseline.
+        std::thread::sleep(MIN_INTERVAL);
+        s.sample(&host);
+        assert_eq!(s.cores()[0].usage, 0.0, "only idle time since the baseline");
     }
 
     #[test]
