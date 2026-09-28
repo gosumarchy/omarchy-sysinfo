@@ -160,14 +160,46 @@ impl InputBuffer {
 
                 Some(Key::Alt(char::from(byte)))
             }
-            // ESC then something that is not a printable key: deliver Esc and
-            // let the next byte decode on its own.
-            Some(_) | None => {
+            // Two escapes are two Esc presses; the second decodes on its own.
+            Some(0x1b) | None => {
                 self.bytes.remove(0);
 
                 Some(Key::Esc)
             }
+            // Alt with Enter, Backspace, Tab or a Ctrl chord. Nothing binds
+            // these, and reading them as Esc quit the app (or, in the
+            // filter, threw the query away on Alt+Backspace).
+            Some(0x00..=0x1f | 0x7f) => {
+                self.bytes.drain(..2);
+
+                Some(Key::Unknown)
+            }
+            // Alt with a non-ASCII key, `ESC ä`: the character after the ESC
+            // is a whole UTF-8 sequence.
+            Some(lead) => self.parse_alt_multibyte(lead),
         }
+    }
+
+    /// `ESC` followed by a UTF-8 lead byte: Alt with a non-ASCII key.
+    fn parse_alt_multibyte(&mut self, lead: u8) -> Option<Key> {
+        let needed = utf8_len(lead);
+        if needed < 2 {
+            // Not a character at all: drop the pair rather than call it Esc.
+            self.bytes.drain(..2);
+
+            return Some(Key::Unknown);
+        }
+        if self.bytes.len() < 1 + needed {
+            // The rest of the character is still on its way.
+            return None;
+        }
+
+        let decoded = std::str::from_utf8(&self.bytes[1..=needed])
+            .ok()
+            .and_then(|s| s.chars().next());
+        self.bytes.drain(..=needed);
+
+        Some(decoded.map_or(Key::Unknown, Key::Alt))
     }
 
     /// xterm style: `ESC [ <params> <final byte>`.
@@ -539,9 +571,36 @@ mod tests {
     }
 
     #[test]
-    fn esc_followed_by_a_control_byte_is_esc_then_that_key() {
-        assert_eq!(feed(&[b"\x1b\r"]), vec![Key::Esc, Key::Enter]);
+    fn alt_with_a_control_key_is_unbound_rather_than_esc() {
+        // Alt+Enter, Alt+Backspace: reading them as Esc quit the app, and in
+        // the filter Alt+Backspace threw the whole query away.
+        assert_eq!(feed(&[b"\x1b\r"]), vec![Key::Unknown]);
+        assert_eq!(feed(&[b"\x1b\x7f"]), vec![Key::Unknown]);
+    }
+
+    #[test]
+    fn two_escapes_are_two_esc_presses() {
         assert_eq!(feed(&[b"\x1b\x1b"]), vec![Key::Esc, Key::Esc]);
+    }
+
+    #[test]
+    fn alt_with_a_non_ascii_key_is_an_alt_chord() {
+        assert_eq!(feed(&["\x1bä".as_bytes()]), vec![Key::Alt('ä')]);
+        assert_eq!(
+            feed(&["\x1b→q".as_bytes()]),
+            vec![Key::Alt('→'), Key::Char('q')]
+        );
+    }
+
+    #[test]
+    fn an_alt_chord_split_inside_its_character_waits_for_the_rest() {
+        let bytes = "\x1bä".as_bytes();
+        assert_eq!(feed(&[&bytes[..2], &bytes[2..]]), vec![Key::Alt('ä')]);
+    }
+
+    #[test]
+    fn esc_before_a_stray_continuation_byte_is_dropped_not_esc() {
+        assert_eq!(feed(&[b"\x1b\x80a"]), vec![Key::Unknown, Key::Char('a')]);
     }
 
     #[test]
