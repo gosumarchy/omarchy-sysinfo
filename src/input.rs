@@ -283,20 +283,41 @@ pub(crate) fn spawn(events: Sender<Event>) {
                 return;
             }
 
-            // Give a lone ESC a moment to become a sequence before calling it
-            // the Esc key.
-            if pending.is_lone_escape() && crate::sys::wait_readable(STDIN, ESC_WAIT) {
-                continue;
-            }
-
-            // Consume whole keys from the front of the buffer.
-            while let Some(key) = pending.take_key() {
-                if events.send(Event::Key(key)).is_err() {
-                    return;
-                }
+            let more_coming = || crate::sys::wait_readable(STDIN, ESC_WAIT);
+            if !drain(&mut pending, more_coming, |key| {
+                events.send(Event::Key(key)).is_ok()
+            }) {
+                return;
             }
         }
     });
+}
+
+/// Decode every whole key at the front of the buffer and hand it to `emit`.
+///
+/// An ESC left on its own, whether it was the whole read or the tail of one
+/// (`ESC [ A ESC` with the next `[ A` still in flight), first gets
+/// `more_coming` to say whether more input is about to arrive; if it is,
+/// the ESC stays buffered for the next read. Checking only reads that were
+/// a lone ESC let a held arrow key over ssh decode as Esc and quit.
+///
+/// Returns false once `emit` reports the receiver is gone.
+fn drain(
+    pending: &mut InputBuffer,
+    mut more_coming: impl FnMut() -> bool,
+    mut emit: impl FnMut(Key) -> bool,
+) -> bool {
+    loop {
+        if pending.is_lone_escape() && more_coming() {
+            return true;
+        }
+        let Some(key) = pending.take_key() else {
+            return true;
+        };
+        if !emit(key) {
+            return false;
+        }
+    }
 }
 
 /// How many bytes `first` announces, or 0 when it cannot start a character.
@@ -601,6 +622,46 @@ mod tests {
     #[test]
     fn esc_before_a_stray_continuation_byte_is_dropped_not_esc() {
         assert_eq!(feed(&[b"\x1b\x80a"]), vec![Key::Unknown, Key::Char('a')]);
+    }
+
+    fn drain_all(pending: &mut InputBuffer, more_coming: bool) -> Vec<Key> {
+        let mut keys = Vec::new();
+        drain(
+            pending,
+            || more_coming,
+            |key| {
+                keys.push(key);
+                true
+            },
+        );
+        keys
+    }
+
+    #[test]
+    fn an_esc_at_the_end_of_a_read_waits_for_the_rest_of_its_sequence() {
+        // A held arrow key over ssh, split as "ESC [ A ESC" then "[ A".
+        let mut pending = InputBuffer::default();
+        pending.extend(b"\x1b[A\x1b");
+        assert_eq!(drain_all(&mut pending, true), vec![Key::Up]);
+
+        pending.extend(b"[A");
+        assert_eq!(drain_all(&mut pending, true), vec![Key::Up]);
+    }
+
+    #[test]
+    fn an_esc_with_nothing_following_is_the_esc_key() {
+        let mut pending = InputBuffer::default();
+        pending.extend(b"\x1b[A\x1b");
+
+        assert_eq!(drain_all(&mut pending, false), vec![Key::Up, Key::Esc]);
+    }
+
+    #[test]
+    fn drain_stops_when_the_receiver_is_gone() {
+        let mut pending = InputBuffer::default();
+        pending.extend(b"abc");
+
+        assert!(!drain(&mut pending, || false, |_| false));
     }
 
     #[test]
