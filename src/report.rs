@@ -1,5 +1,6 @@
 //! The plain-text report: every section, one line per row, no escape codes.
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::time::Duration;
 
@@ -64,16 +65,12 @@ fn format_report(sections: &[Section], identifiers: Identifiers) -> Vec<String> 
         .flat_map(|s| format_section(s, identifiers))
         .collect();
 
-    let hid_something = identifiers == Identifiers::Hide
-        && sections.iter().flat_map(|s| &s.rows).any(|r| {
-            matches!(
-                r,
-                Row::Field {
-                    sensitivity: Sensitivity::Identifier,
-                    ..
-                }
-            )
-        });
+    let hid_something = sections.iter().flat_map(|s| &s.rows).any(|r| match r {
+        Row::Field {
+            value, sensitivity, ..
+        } => plain_value(value, *sensitivity, identifiers) != value.as_str(),
+        Row::Header(_) | Row::Note(_) | Row::Blank => false,
+    });
     if hid_something {
         lines.push(String::new());
         lines.push(format!(
@@ -82,6 +79,64 @@ fn format_report(sections: &[Section], identifiers: Identifiers) -> Vec<String> 
     }
 
     lines
+}
+
+/// A row's value as the plain report prints it.
+fn plain_value(value: &str, sensitivity: Sensitivity, identifiers: Identifiers) -> Cow<'_, str> {
+    match (sensitivity, identifiers) {
+        (Sensitivity::Identifier, Identifiers::Hide) => Cow::Borrowed(HIDDEN),
+        (Sensitivity::Embedded, Identifiers::Hide) => Cow::Owned(mask_uuids(value)),
+        (_, Identifiers::Show) | (Sensitivity::Public, Identifiers::Hide) => Cow::Borrowed(value),
+    }
+}
+
+/// Replace the UUIDs inside a value: anything after `UUID=` or `PARTUUID=`
+/// up to the next separator (which catches short vfat ids like `ABCD-1234`),
+/// and any bare `8-4-4-4-12` hex UUID (`rd.luks.name=<uuid>=root`).
+fn mask_uuids(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut i = 0;
+
+    while let Some(c) = value[i..].chars().next() {
+        if let Some(len) = identifier_at(value, i) {
+            out.push_str(HIDDEN);
+            i += len;
+        } else {
+            out.push(c);
+            i += c.len_utf8();
+        }
+    }
+
+    out
+}
+
+/// The byte length of an identifier starting at `i`, if one does.
+fn identifier_at(value: &str, i: usize) -> Option<usize> {
+    let rest = &value[i..];
+
+    if value[..i].ends_with("UUID=") {
+        let len = rest
+            .find(|c: char| c.is_whitespace() || matches!(c, ':' | ',' | ';' | '='))
+            .unwrap_or(rest.len());
+
+        return (len > 0).then_some(len);
+    }
+
+    let starts_word = !value[..i]
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_hexdigit() || c == '-');
+
+    (starts_word && rest.get(..36).is_some_and(is_uuid)).then_some(36)
+}
+
+/// `0123abcd-0123-0123-0123-0123456789ab`, either case.
+fn is_uuid(candidate: &str) -> bool {
+    candidate.len() == 36
+        && candidate.char_indices().all(|(i, c)| match i {
+            8 | 13 | 18 | 23 => c == '-',
+            _ => c.is_ascii_hexdigit(),
+        })
 }
 
 /// The plain-text rendering of one section, one string per line.
@@ -102,12 +157,7 @@ fn format_section(section: &Section, identifiers: Identifiers) -> Vec<String> {
                 bar,
                 sensitivity,
             } => {
-                let value = match (sensitivity, identifiers) {
-                    (Sensitivity::Identifier, Identifiers::Hide) => HIDDEN,
-                    (Sensitivity::Identifier, Identifiers::Show) | (Sensitivity::Public, _) => {
-                        value.as_str()
-                    }
-                };
+                let value = plain_value(value, *sensitivity, identifiers);
                 lines.push(match bar {
                     // The value already carrying a percentage is left alone, so
                     // it is never printed twice.
@@ -281,6 +331,58 @@ mod tests {
 
         assert!(report.contains("PF3ABCDE"), "{report}");
         assert!(!report.contains("<hidden>"), "{report}");
+    }
+
+    #[test]
+    fn uuids_inside_a_command_line_are_masked_and_the_rest_kept() {
+        let cmdline = "BOOT_IMAGE=/vmlinuz-linux \
+            cryptdevice=PARTUUID=0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8f9:root \
+            root=/dev/mapper/root resume=UUID=ABCD-1234 \
+            rd.luks.name=11111111-2222-3333-4444-555555555555=root quiet";
+        let sections = [section(vec![Row::with_embedded_identifiers(
+            "Command line",
+            cmdline,
+        )])];
+
+        let hidden = format_report(&sections, Identifiers::Hide).join("\n");
+        assert!(!hidden.contains("0a1b2c3d"), "{hidden}");
+        assert!(!hidden.contains("ABCD-1234"), "{hidden}");
+        assert!(!hidden.contains("11111111"), "{hidden}");
+        assert!(
+            hidden.contains("cryptdevice=PARTUUID=<hidden>:root"),
+            "{hidden}"
+        );
+        assert!(
+            hidden.contains("rd.luks.name=<hidden>=root quiet"),
+            "{hidden}"
+        );
+        assert!(hidden.contains("root=/dev/mapper/root"), "{hidden}");
+        assert!(
+            hidden.contains("--identifiers"),
+            "the footnote explains the mask"
+        );
+
+        let shown = format_report(&sections, Identifiers::Show).join("\n");
+        assert!(shown.contains("ABCD-1234"), "{shown}");
+    }
+
+    #[test]
+    fn a_command_line_without_uuids_is_untouched_and_needs_no_footnote() {
+        let sections = [section(vec![Row::with_embedded_identifiers(
+            "Command line",
+            "root=/dev/sda2 quiet splash",
+        )])];
+        let report = format_report(&sections, Identifiers::Hide).join("\n");
+
+        assert!(report.contains("root=/dev/sda2 quiet splash"));
+        assert!(!report.contains("--identifiers"));
+    }
+
+    #[test]
+    fn is_uuid_checks_shape_not_just_length() {
+        assert!(is_uuid("0A1B2C3D-4E5F-6071-8293-A4B5C6D7E8F9"));
+        assert!(!is_uuid("0a1b2c3d-4e5f-6071-8293-a4b5c6d7e8fz"));
+        assert!(!is_uuid("0a1b2c3d4e5f607182934a4b5c6d7e8f9abc"));
     }
 
     #[test]

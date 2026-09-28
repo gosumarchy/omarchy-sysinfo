@@ -26,7 +26,12 @@ pub(crate) fn rows(host: &Host, stats: &Stats) -> Vec<Row> {
     }
 
     rows.push(Row::header("Boot"));
-    rows.push(Row::field("Command line", dash(host.cmdline())));
+    // The command line names the root and resume devices, usually by UUID
+    // (`cryptdevice=PARTUUID=...`, `resume=UUID=...`).
+    rows.push(Row::with_embedded_identifiers(
+        "Command line",
+        dash(host.cmdline()),
+    ));
     for key in [
         "quiet",
         "splash",
@@ -37,7 +42,7 @@ pub(crate) fn rows(host: &Host, stats: &Stats) -> Vec<Row> {
         "nowatchdog",
     ] {
         if let Some(value) = host.kernel_param(key) {
-            rows.push(Row::field(format!("  {key}"), value));
+            rows.push(Row::with_embedded_identifiers(format!("  {key}"), value));
         }
     }
     rows.push(Row::field(

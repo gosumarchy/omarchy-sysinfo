@@ -78,6 +78,10 @@ pub(crate) enum Sensitivity {
     Public,
     /// A serial, UUID, MAC address, or something the user was looking at.
     Identifier,
+    /// Useful as a whole but carrying identifiers inside it, like a kernel
+    /// command line with `root=UUID=...`. The plain report masks the
+    /// identifiers in place instead of hiding the whole value.
+    Embedded,
 }
 
 /// One line of a section's body.
@@ -132,6 +136,16 @@ impl Row {
             value: value.into(),
             bar: None,
             sensitivity: Sensitivity::Identifier,
+        }
+    }
+
+    /// A row whose value may contain identifiers (UUIDs) among other text.
+    pub(crate) fn with_embedded_identifiers(label: impl Into<Text>, value: impl Into<Text>) -> Row {
+        Row::Field {
+            label: label.into(),
+            value: value.into(),
+            bar: None,
+            sensitivity: Sensitivity::Embedded,
         }
     }
 
