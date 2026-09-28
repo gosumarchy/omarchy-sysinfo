@@ -218,22 +218,47 @@ fn ago(then: SystemTime, now: SystemTime) -> String {
 fn shell_state(host: &Host) -> &'static str {
     // Releases before 4 ran a process literally called omarchy-shell; 4 and
     // later run the shell under quickshell.
-    if host.exists("/run/omarchy-shell") || process_running(host, "omarchy-shell") {
-        "omarchy-shell"
-    } else if process_running(host, "quickshell") {
-        "quickshell (bar, menus)"
-    } else {
-        "not running"
+    if host.exists("/run/omarchy-shell") {
+        return "omarchy-shell";
+    }
+
+    match running_shell(host) {
+        Some(Shell::OmarchyShell) => "omarchy-shell",
+        Some(Shell::Quickshell) => "quickshell (bar, menus)",
+        None => "not running",
     }
 }
 
-/// Whether any process has this exact `comm`, by walking `/proc` rather than
-/// forking `pgrep` on every refresh.
-fn process_running(host: &Host, comm: &str) -> bool {
-    host.list_dir("/proc").iter().any(|dir| {
-        file_name(dir).chars().all(|c| c.is_ascii_digit())
-            && read(dir.join("comm")).as_deref() == Some(comm)
-    })
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Shell {
+    OmarchyShell,
+    Quickshell,
+}
+
+/// Which shell is running, from one pass over `/proc` rather than forking
+/// `pgrep`, or walking `/proc` once per name, on every refresh. The pass
+/// stops at the first omarchy-shell, which wins over quickshell, and the
+/// directory is not sorted since order does not matter here.
+fn running_shell(host: &Host) -> Option<Shell> {
+    let entries = std::fs::read_dir(host.path("/proc")).ok()?;
+    let mut found = None;
+
+    for entry in entries.flatten() {
+        let is_pid = entry
+            .file_name()
+            .to_str()
+            .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()));
+        if !is_pid {
+            continue;
+        }
+        match read(entry.path().join("comm")).as_deref() {
+            Some("omarchy-shell") => return Some(Shell::OmarchyShell),
+            Some("quickshell") => found = Some(Shell::Quickshell),
+            Some(_) | None => {}
+        }
+    }
+
+    found
 }
 
 fn compositor_version(host: &Host) -> String {
@@ -955,6 +980,16 @@ SUPER + SHIFT + S  →  Toggle the screenshots daemon
 
         assert_eq!(shell_state(&fx.host()), "quickshell (bar, menus)");
         assert_eq!(shell_state(&Fixture::new().host()), "not running");
+    }
+
+    #[test]
+    fn omarchy_shell_wins_over_quickshell_in_one_pass() {
+        let fx = Fixture::new();
+        fx.write("proc/100/comm", "quickshell\n");
+        fx.write("proc/200/comm", "omarchy-shell\n");
+
+        assert_eq!(running_shell(&fx.host()), Some(Shell::OmarchyShell));
+        assert_eq!(shell_state(&fx.host()), "omarchy-shell");
     }
 
     // ---- the section against a fixture ------------------------------------------
