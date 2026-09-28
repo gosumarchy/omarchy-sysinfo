@@ -277,7 +277,13 @@ fn parse_flags(cpuinfo: &str) -> String {
     .map(|(name, _)| name)
     .collect();
 
-    format!("{}  (+{} more)", marks.join(" "), flags.len())
+    // Each mark stands for exactly one flag, so the rest is the difference.
+    let rest = flags.len() - marks.len();
+    match (marks.is_empty(), rest) {
+        (true, _) => format!("{rest} flags"),
+        (false, 0) => marks.join(" "),
+        (false, _) => format!("{}  (+{rest} more)", marks.join(" ")),
+    }
 }
 
 #[cfg(test)]
@@ -382,9 +388,8 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep aes avx2 avx512f fma sha_
     #[test]
     fn parse_flags_reports_how_many_were_left_out() {
         let s = parse_flags(X86_CPUINFO);
-        assert!(s.contains("(+"), "expected a remainder count: {s:?}");
-        // 19 flags in the fixture, 8 of them named.
-        assert!(s.contains("19"), "{s:?}");
+        // 19 flags in the fixture, 8 of them named: 11 left out, not 19.
+        assert!(s.ends_with("  (+11 more)"), "{s:?}");
     }
 
     #[test]
@@ -411,9 +416,14 @@ flags\t\t: fpu vme de pse tsc msr pae mce cx8 apic sep aes avx2 avx512f fma sha_
     }
 
     #[test]
+    fn parse_flags_with_every_flag_named_has_no_remainder() {
+        assert_eq!(parse_flags("flags\t\t: avx2 aes\n"), "avx2 aes");
+    }
+
+    #[test]
     fn parse_flags_with_nothing_recognised_still_reports_the_count() {
         let s = parse_flags("flags\t\t: fpu vme de pse tsc\n");
-        assert!(s.contains("(+5 more)"), "{s:?}");
+        assert_eq!(s, "5 flags", "nothing named, so nothing is 'more'");
     }
 
     // ---- CpuInfo -----------------------------------------------------------
