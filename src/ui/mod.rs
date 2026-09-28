@@ -438,6 +438,7 @@ fn help(buffer: &mut Buffer, palette: &Palette) {
 mod tests {
     use super::*;
     use crate::collect::{Section, Snapshot};
+    use crate::event::Trigger;
     use crate::input::Key;
     use crate::term::Color;
     use crate::text::Text;
@@ -488,7 +489,7 @@ mod tests {
     /// A hand-built App so the tests do not depend on this machine's hardware.
     fn app_with(sections: Vec<Section>, height: u16) -> App {
         let mut app = App::new();
-        app.on_snapshot(snapshot(sections));
+        app.on_snapshot(snapshot(sections), Trigger::Timer);
         app.set_viewport(detail_rows(height));
         app
     }

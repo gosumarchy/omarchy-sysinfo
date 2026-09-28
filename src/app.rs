@@ -5,6 +5,7 @@
 use std::time::{Duration, Instant};
 
 use crate::collect::{Row, Section, Snapshot};
+use crate::event::Trigger;
 use crate::input::Key;
 
 /// How long a status message stays in the footer.
@@ -167,12 +168,16 @@ impl App {
 
     /// Take a fresh snapshot, keeping the selection and scroll where they
     /// were as far as the new data allows.
-    pub(crate) fn on_snapshot(&mut self, snapshot: Snapshot) {
+    ///
+    /// Only a snapshot the worker took because of a refresh request says
+    /// "refreshed"; one that was already being collected when `r` was
+    /// pressed would claim fresh data it does not have.
+    pub(crate) fn on_snapshot(&mut self, snapshot: Snapshot, trigger: Trigger) {
         self.snapshot = Some(snapshot);
         self.selected = self.selected.min(self.sections().len().saturating_sub(1));
         self.clamp_scroll();
 
-        if self.refresh_pending {
+        if self.refresh_pending && trigger == Trigger::Request {
             self.refresh_pending = false;
             self.set_status("refreshed");
         }
@@ -391,11 +396,14 @@ mod tests {
                 .collect::<Vec<Row>>()
         };
         let mut app = App::new();
-        app.on_snapshot(snapshot(vec![
-            Section::new("One", many("one")),
-            Section::new("Two", many("two")),
-            Section::new("Three", many("three")),
-        ]));
+        app.on_snapshot(
+            snapshot(vec![
+                Section::new("One", many("one")),
+                Section::new("Two", many("two")),
+                Section::new("Three", many("three")),
+            ]),
+            Trigger::Timer,
+        );
         app.set_viewport(VIEWPORT);
         app
     }
@@ -574,14 +582,17 @@ mod tests {
     #[test]
     fn visible_rows_counts_only_rows_the_filter_keeps() {
         let mut a = app();
-        a.on_snapshot(snapshot(vec![Section::new(
-            "Only",
-            vec![
-                Row::field("alpha", "1"),
-                Row::Blank,
-                Row::field("beta", "2"),
-            ],
-        )]));
+        a.on_snapshot(
+            snapshot(vec![Section::new(
+                "Only",
+                vec![
+                    Row::field("alpha", "1"),
+                    Row::Blank,
+                    Row::field("beta", "2"),
+                ],
+            )]),
+            Trigger::Timer,
+        );
         assert_eq!(a.visible_rows().len(), 3);
         a.filter = filter("a");
         assert_eq!(a.visible_rows().len(), 2, "the blank row drops out");
@@ -593,7 +604,7 @@ mod tests {
     fn a_smaller_snapshot_pulls_the_selection_back_into_range() {
         let mut a = app();
         a.select(2);
-        a.on_snapshot(snapshot(vec![Section::new("Only", vec![])]));
+        a.on_snapshot(snapshot(vec![Section::new("Only", vec![])]), Trigger::Timer);
         assert_eq!(a.selected, 0);
         assert!(a.section().is_some());
     }
@@ -734,14 +745,21 @@ mod tests {
         assert_eq!(a.on_key(Key::Char('r')), Action::Refresh);
         assert_eq!(a.status(), Some("refreshing…"));
 
-        a.on_snapshot(snapshot(vec![Section::new("One", vec![])]));
+        // A snapshot already in flight when `r` was pressed is not the answer.
+        a.on_snapshot(snapshot(vec![Section::new("One", vec![])]), Trigger::Timer);
+        assert_eq!(a.status(), Some("refreshing…"));
+
+        a.on_snapshot(
+            snapshot(vec![Section::new("One", vec![])]),
+            Trigger::Request,
+        );
         assert_eq!(a.status(), Some("refreshed"));
     }
 
     #[test]
     fn a_timed_snapshot_does_not_claim_a_manual_refresh() {
         let mut a = app();
-        a.on_snapshot(snapshot(vec![Section::new("One", vec![])]));
+        a.on_snapshot(snapshot(vec![Section::new("One", vec![])]), Trigger::Timer);
         assert_eq!(a.status(), None);
     }
 
@@ -844,7 +862,7 @@ mod tests {
         a.on_key(Key::Char('/'));
         a.on_key(Key::Char('g'));
         a.on_key(Key::Enter);
-        a.on_snapshot(snapshot(vec![Section::new("One", vec![])]));
+        a.on_snapshot(snapshot(vec![Section::new("One", vec![])]), Trigger::Timer);
         assert_eq!(
             a.filter().query(),
             "g",

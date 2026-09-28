@@ -11,7 +11,7 @@ use std::thread;
 use std::time::Duration;
 
 use crate::collect::{Collector, Host};
-use crate::event::Event;
+use crate::event::{Event, Trigger};
 
 /// How often the machine is re-read without being asked.
 const INTERVAL: Duration = Duration::from_secs(2);
@@ -46,22 +46,24 @@ fn spawn_with(
     thread::spawn(move || {
         let mut collector = Collector::new(host);
         let mut wait = prime;
+        let mut trigger = Trigger::Timer;
 
         loop {
-            if events
-                .send(Event::Snapshot(Box::new(collector.collect())))
-                .is_err()
-            {
+            let snapshot = Box::new(collector.collect());
+            if events.send(Event::Snapshot(snapshot, trigger)).is_err() {
                 return;
             }
 
-            match incoming.recv_timeout(wait) {
+            trigger = match incoming.recv_timeout(wait) {
                 // A held `r` queues many requests; one collection answers
                 // them all.
-                Ok(Request::Refresh) => while incoming.try_recv().is_ok() {},
-                Err(RecvTimeoutError::Timeout) => {}
+                Ok(Request::Refresh) => {
+                    while incoming.try_recv().is_ok() {}
+                    Trigger::Request
+                }
+                Err(RecvTimeoutError::Timeout) => Trigger::Timer,
                 Err(RecvTimeoutError::Disconnected) => return,
-            }
+            };
             wait = interval;
         }
     });
@@ -76,9 +78,9 @@ mod tests {
 
     const LONG: Duration = Duration::from_secs(3600);
 
-    fn next_snapshot(events: &mpsc::Receiver<Event>) {
+    fn next_snapshot(events: &mpsc::Receiver<Event>) -> Trigger {
         match events.recv_timeout(Duration::from_secs(10)) {
-            Ok(Event::Snapshot(_)) => {}
+            Ok(Event::Snapshot(_, trigger)) => trigger,
             other => panic!("expected a snapshot, got {other:?}"),
         }
     }
@@ -89,9 +91,9 @@ mod tests {
         let (tx, events) = mpsc::channel();
         let refresh = spawn_with(fx.host(), tx, LONG, LONG);
 
-        next_snapshot(&events);
+        assert_eq!(next_snapshot(&events), Trigger::Timer);
         refresh.send(Request::Refresh).expect("worker alive");
-        next_snapshot(&events);
+        assert_eq!(next_snapshot(&events), Trigger::Request);
     }
 
     #[test]

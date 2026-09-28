@@ -132,8 +132,8 @@ fn tui() -> Result<()> {
                     Action::Nothing => {}
                 }
             }
-            Ok(Event::Snapshot(snapshot)) => {
-                app.on_snapshot(*snapshot);
+            Ok(Event::Snapshot(snapshot, trigger)) => {
+                app.on_snapshot(*snapshot, trigger);
                 redraw = true;
             }
             Ok(Event::InputClosed) | Err(RecvTimeoutError::Disconnected) => return Ok(()),
