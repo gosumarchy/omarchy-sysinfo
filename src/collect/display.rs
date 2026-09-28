@@ -85,7 +85,9 @@ fn parse_monitors(out: &str) -> Vec<Row> {
             continue;
         }
 
-        rows.push(if key == "serial" {
+        // Hyprland builds `description` from make, model and serial, so it
+        // carries the serial as surely as the `serial` line does.
+        rows.push(if matches!(key, "serial" | "description") {
             Row::identifier(key, value)
         } else {
             Row::field(key, value)
@@ -236,10 +238,17 @@ Monitor DP-2 (DP-2 3440x1440) (0x1f) at 2560x140:
     }
 
     #[test]
-    fn a_monitor_serial_is_an_identifier() {
-        let rows = parse_monitors(MONITORS);
+    fn a_monitor_serial_is_an_identifier_wherever_it_appears() {
+        let rows = parse_monitors(
+            "Monitor DP-2 (ID 1):\n\tdescription: Dell Inc. DELL U2723QE 5KC1234 (DP-2)\n\tmake: Dell Inc.\n\tserial: 5KC1234\n",
+        );
 
-        assert!(rows.contains(&Row::identifier("serial", "ABC123")));
+        assert!(rows.contains(&Row::identifier("serial", "5KC1234")));
+        assert!(rows.contains(&Row::identifier(
+            "description",
+            "Dell Inc. DELL U2723QE 5KC1234 (DP-2)"
+        )));
+        assert!(rows.contains(&Row::field("make", "Dell Inc.")));
     }
 
     // ---- workspaces and windows ---------------------------------------------
