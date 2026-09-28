@@ -10,7 +10,8 @@ pub(crate) fn rows(host: &Host, stats: &Stats) -> Vec<Row> {
     let os_release = host.read("/etc/os-release").unwrap_or_default();
 
     let mut rows = vec![Row::header("System")];
-    rows.push(Row::field("Hostname", hostname(host)));
+    // Hostnames are often a person's name (`georgios-thinkpad`).
+    rows.push(Row::identifier("Hostname", hostname(host)));
     rows.push(Row::field("Distribution", distro_from(&os_release)));
     rows.push(Row::field(
         "Build",
@@ -432,6 +433,18 @@ EMPTY=
     fn boot_time_tolerates_a_clock_set_backwards() {
         // A boot time in the future must not wrap into a huge uptime.
         assert!(format_boot_time(2_000, 1_000).ends_with("(0m 0s ago)"));
+    }
+
+    #[test]
+    fn the_hostname_is_an_identifier() {
+        let fx = Fixture::new();
+        fx.write("proc/sys/kernel/hostname", "georgios-thinkpad\n");
+        let host = fx.host();
+
+        assert!(
+            rows(&host, &Stats::new(&host))
+                .contains(&Row::identifier("Hostname", "georgios-thinkpad"))
+        );
     }
 
     #[test]

@@ -12,8 +12,8 @@ usage: omarchy-sysinfo [--plain [--identifiers]]
 
 (no args)       interactive TUI
 --plain         print every section and exit
---identifiers   with --plain, include serials, UUIDs, MAC addresses,
-                network names and the focused window title
+--identifiers   with --plain, include the hostname, serials, UUIDs,
+                MAC addresses, network names and the focused window title
 --version       print the version
 --help          print this help
 

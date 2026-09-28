@@ -17,7 +17,8 @@ pub(super) fn rows(
 
     let mut rows = vec![
         Row::header("Identity"),
-        Row::field("Host", system::hostname(host)),
+        // Hostnames are often a person's name (`georgios-thinkpad`).
+        Row::identifier("Host", system::hostname(host)),
         Row::field("Distro", system::distro(host)),
         Row::field("Kernel", system::kernel(host)),
         Row::field("Chassis", dmi::chassis(host)),
@@ -110,6 +111,7 @@ mod tests {
         );
 
         assert!(rows.contains(&Row::field("Board", "unknown")));
+        assert!(rows.contains(&Row::identifier("Host", "-")));
         assert!(rows.contains(&Row::field("Battery", "no battery · -")));
         assert!(
             !rows

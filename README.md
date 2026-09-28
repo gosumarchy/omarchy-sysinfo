@@ -76,7 +76,7 @@ omarchy-sysinfo --plain > sysinfo.txt
 |---|---|
 | *(none)* | interactive TUI |
 | `--plain` | print every section and exit |
-| `--plain --identifiers` | the same, including serials, UUIDs, MAC addresses, network names and the focused window title |
+| `--plain --identifiers` | the same, including the hostname, serials, UUIDs, MAC addresses, network names and the focused window title |
 | `--version` | print the version |
 | `--help` | usage |
 
